@@ -4,13 +4,13 @@
 
 Claude Code (recommended — auto-updates via marketplace):
 ```
-/plugin marketplace add bradautomates/claude-video
+/plugin marketplace add mustafa-nom/claude-video
 /plugin install watch@claude-video
 ```
 
 Codex, Cursor, Copilot, Gemini CLI, or any of 50+ [Agent Skills](https://agentskills.io) hosts:
 ```bash
-npx skills add bradautomates/claude-video -g
+npx skills add mustafa-nom/claude-video -g
 ```
 (`-g` installs globally for your user, available across all projects. Drop it to scope per-project.)
 
@@ -99,15 +99,15 @@ End-to-end from a cold URL, `transcript` is the cheapest mode by far; the frame 
 
 | Surface | Install |
 |---------|---------|
-| **Claude Code** | `/plugin marketplace add bradautomates/claude-video` then `/plugin install watch@claude-video` |
-| **Codex, Cursor, Copilot, Gemini CLI, +50 more** | `npx skills add bradautomates/claude-video -g` |
-| **claude.ai** (web) | [Download `watch.skill`](https://github.com/bradautomates/claude-video/releases/latest) → Settings → Capabilities → Skills → `+` |
+| **Claude Code** | `/plugin marketplace add mustafa-nom/claude-video` then `/plugin install watch@claude-video` |
+| **Codex, Cursor, Copilot, Gemini CLI, +50 more** | `npx skills add mustafa-nom/claude-video -g` |
+| **claude.ai** (web) | [Download `watch.skill`](https://github.com/mustafa-nom/claude-video/releases/latest) → Settings → Capabilities → Skills → `+` |
 | **Manual / dev** | `git clone` then symlink `skills/watch` into your host's skills dir (see below) |
 
 ### Claude Code
 
 ```
-/plugin marketplace add bradautomates/claude-video
+/plugin marketplace add mustafa-nom/claude-video
 /plugin install watch@claude-video
 ```
 
@@ -118,7 +118,7 @@ Update later with `/plugin update watch@claude-video`.
 The [Agent Skills](https://agentskills.io) CLI installs the skill into whatever agents it detects:
 
 ```bash
-npx skills add bradautomates/claude-video -g
+npx skills add mustafa-nom/claude-video -g
 ```
 
 `-g` installs globally for your user (`~/.codex/skills`, `~/.cursor/skills`, etc.); drop it to install into the current project instead. Useful flags:
@@ -133,7 +133,7 @@ Update later with `npx skills update watch -g`.
 
 ### claude.ai (web)
 
-1. [Download `watch.skill`](https://github.com/bradautomates/claude-video/releases/latest) from the latest release.
+1. [Download `watch.skill`](https://github.com/mustafa-nom/claude-video/releases/latest) from the latest release.
 2. Go to Settings → Capabilities → Skills.
 3. Click `+` and drop the file in.
 
@@ -144,7 +144,7 @@ Enable "Code execution and file creation" under Capabilities first — the skill
 Clone the repo and symlink the self-contained skill folder into your host's skills directory — the symlink keeps the install in sync with your working tree as you edit:
 
 ```bash
-git clone https://github.com/bradautomates/claude-video.git
+git clone https://github.com/mustafa-nom/claude-video.git
 ln -s "$(pwd)/claude-video/skills/watch" ~/.claude/skills/watch   # or ~/.codex/skills/watch
 ```
 
@@ -253,14 +253,14 @@ Built by Brad Bonanno — I make content about building with AI on [YouTube (@br
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=bradautomates%2Fclaude-video&type=date&legend=top-left">
+<a href="https://www.star-history.com/?repos=mustafa-nom%2Fclaude-video&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=bradautomates/claude-video&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=bradautomates/claude-video&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=bradautomates/claude-video&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=mustafa-nom/claude-video&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=mustafa-nom/claude-video&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=mustafa-nom/claude-video&type=date&legend=top-left" />
  </picture>
 </a>
 
 ---
 
-[github.com/bradautomates/claude-video](https://github.com/bradautomates/claude-video) · [@bradbonanno](https://www.youtube.com/@bradbonanno) · [Solaris Automation](https://www.solarisautomation.io/) · [LICENSE](LICENSE)
+[github.com/mustafa-nom/claude-video](https://github.com/mustafa-nom/claude-video) · [@bradbonanno](https://www.youtube.com/@bradbonanno) · [Solaris Automation](https://www.solarisautomation.io/) · [LICENSE](LICENSE)

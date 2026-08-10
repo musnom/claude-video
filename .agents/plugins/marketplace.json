@@ -8,7 +8,7 @@
       "name": "watch",
       "source": {
         "source": "url",
-        "url": "https://github.com/bradautomates/claude-video.git"
+        "url": "https://github.com/mustafa-nom/claude-video.git"
       },
       "policy": {
         "installation": "AVAILABLE",
