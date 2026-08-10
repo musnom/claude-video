@@ -6,7 +6,7 @@ argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
 homepage: https://github.com/mustafa-nom/claude-video
 repository: https://github.com/mustafa-nom/claude-video
-author: bradautomates
+author: mustafa-nom
 license: MIT
 user-invocable: true
 ---

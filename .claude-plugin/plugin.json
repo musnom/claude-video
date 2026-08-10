@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "description": "Let Claude watch a video. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls captions or falls back to Whisper, and hands frames + transcript to Claude so it can answer questions about the video.",
   "author": {
-    "name": "Bradley Bonanno"
+    "name": "Mustafa Nomair"
   },
   "homepage": "https://github.com/mustafa-nom/claude-video",
   "repository": "https://github.com/mustafa-nom/claude-video",
