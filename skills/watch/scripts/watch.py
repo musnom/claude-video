@@ -24,18 +24,36 @@ from config import ensure_utf8_console, frame_cap, get_config  # noqa: E402
 # the download and every frame extraction have already succeeded.
 ensure_utf8_console()
 from download import download, fetch_captions, is_url  # noqa: E402
-from frames import MAX_FPS, MOTION_HARD_MAX, measure_motion, motion_envelope, parse_crop, validate_crop, auto_fps, auto_fps_focus, extract_at_timestamps, extract_motion, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from frames import MAX_FPS, MOTION_HARD_MAX, MOTION_TOKEN_CEILING, SCENE_THRESHOLD, frame_dimensions, image_tokens, measure_motion, motion_envelope, motion_interval, parse_crop, validate_crop, auto_fps, auto_fps_focus, extract_at_timestamps, extract_motion, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
 
-# Frame kinds sampled densely enough that several land inside one second. Whole
-# -second labels are actively wrong for these: at 50ms spacing, format_time
-# rounds t=0.55 up to 00:01 while t=0.50 stays 00:00, putting the implied
-# boundary a frame away from the real one. The scene, keyframe and uniform
-# engines keep whole-second labels — they are navigation aids, and changing them
-# would alter every existing report.
-PRECISE_FRAME_REASONS = {"transcript-cue", "motion"}
+# Every frame kind now carries a sub-second label. Whole seconds were kept for
+# the scene, keyframe and uniform engines on the grounds that those frames are
+# navigation aids — which is true right up until the video cuts faster than once
+# a second, and then the label stops being able to describe the thing it points
+# at. Measured on a 120-shot clip that fit *under* the frame cap: 20% of
+# consecutive frames printed the identical timestamp. Fast cutting lives in the
+# 0.3-1.0s band, which is precisely the band whole seconds cannot represent, and
+# it is the band an editing-style question is asking about.
+#
+# format_time rounds, so the old labels were not merely coarse, they were
+# placed wrong: at 50ms spacing t=0.55 printed 00:01 while t=0.50 printed 00:00,
+# putting the implied boundary a frame away from the real cut.
+#
+# Precision is honest for these because the timestamps are measured — scene and
+# keyframe frames carry ffmpeg's own pts_time, cue and gap-fill frames were
+# requested at an exact instant. `uniform` is the exception and is included
+# anyway: its timestamp is nominal (`i / fps`, where the sampler asked rather
+# than where the pixels are), so it can be early by up to half a sampling
+# period. Printing it at one precision and everything else at another would
+# imply the difference is about the clock rather than about the sampler; the
+# report says which engine ran, and the Frames line says what that means.
+PRECISE_FRAME_REASONS = {
+    "transcript-cue", "motion", "scene-change", "first-frame", "keyframe",
+    "uniform", "gap-fill",
+}
 
 
 def _frame_stamp(frame: dict) -> str:
@@ -58,6 +76,45 @@ def needs_pixels(cue_timestamps: list, motion: bool) -> bool:
     useless. Both --timestamps and --motion need pixels.
     """
     return bool(cue_timestamps) or bool(motion)
+
+
+def refuse_if_live(info: dict) -> None:
+    """Stop before downloading a stream that has no end.
+
+    yt-dlp handed a live URL records until the broadcast finishes, so a 24/7
+    channel is an unbounded download and /watch appears to hang — no output, no
+    error, forever. ``fetch_captions`` already runs ``--skip-download
+    --write-info-json``, so the flags that answer this are on disk before the
+    download starts and cost nothing.
+
+    ``post_live`` is deliberately allowed: the broadcast has ended and the
+    platform is still assembling the VOD, so the artifact is bounded even though
+    the video is not a normal upload yet.
+
+    Tolerates ``{}`` — ``fetch_captions`` passes ``--ignore-errors`` and never
+    checks yt-dlp's return code, so an empty info dict is a normal outcome and
+    must not be read as "not live".
+
+    Deliberately does NOT suggest --start/--end as a workaround. Those flags trim
+    during extraction, after the download has already completed, so on a live
+    source they would bound nothing — the advice would sound actionable and hang
+    exactly as before.
+    """
+    status = info.get("live_status")
+    if status == "post_live":
+        return
+    if info.get("is_live") or status == "is_live":
+        raise SystemExit(
+            "This URL is a live broadcast. yt-dlp would record it until it ends, "
+            "which for an ongoing stream means /watch never returns.\n"
+            "Re-run once the stream has finished — the same URL then resolves to a "
+            "normal recording — or point /watch at an already-archived clip."
+        )
+    if status == "is_upcoming":
+        raise SystemExit(
+            "This URL is a scheduled broadcast that has not started, so there is "
+            "nothing to download yet. Re-run after it has aired."
+        )
 
 
 def write_motion_data(
@@ -90,7 +147,11 @@ def write_motion_data(
             "end": frame_meta.get("window", (None, None))[1],
         },
         "sampling": {
-            "mode": "every-source-frame" if not frame_meta.get("interval") else "thinned",
+            "mode": (
+                "every-source-frame"
+                if not frame_meta.get("interval") and not frame_meta.get("even_sampled")
+                else "thinned"
+            ),
             "interval_ms": round((frame_meta.get("interval") or 0.0) * 1000, 1),
             "sampled_fps": frame_meta.get("sampled_fps"),
             "source_fps": frame_meta.get("source_fps"),
@@ -107,6 +168,10 @@ def write_motion_data(
                 "gap_ms": f["gap_ms"],
                 "mean_delta": f["mean_delta"],
                 "peak_delta": f["peak_delta"],
+                # The monotone curve the envelope was read off. Included because
+                # per-frame deltas alone cannot be used to re-derive it: on a slow
+                # fade every one of them rounds to zero while this still climbs.
+                "cum_delta": f["cum_delta"],
                 "path": f["path"],
             }
             for f in measured
@@ -177,7 +242,37 @@ def main() -> int:
         help="Disable near-duplicate frame removal. Keeps visually identical "
              "frames (static screen recordings, held slides) instead of collapsing them.",
     )
+    ap.add_argument(
+        "--cookies-from-browser",
+        type=str,
+        default=None,
+        metavar="BROWSER[+KEYRING][:PROFILE][::CONTAINER]",
+        help="Read cookies from a local browser profile so yt-dlp can reach a "
+             "login-walled or age-gated video (e.g. `chrome`, `firefox:default`). "
+             "Opt-in only — nothing is read unless you pass this.",
+    )
+    ap.add_argument(
+        "--cookies",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="Netscape-format cookie file for yt-dlp. Alternative to "
+             "--cookies-from-browser when you have exported cookies already.",
+    )
+    ap.add_argument(
+        "--scene-threshold",
+        type=float,
+        default=None,
+        help=f"How different two frames must be to count as a cut, 0-1 (default "
+             f"{SCENE_THRESHOLD}). Lower finds more cuts. Motion graphics and slide decks "
+             "change part of the frame rather than all of it and score around 0.05-0.10; "
+             "camera cuts score 0.8+. Scene engine only (`--detail balanced`/`token-burner`).",
+    )
     args = ap.parse_args()
+    if args.scene_threshold is not None and not 0.0 < args.scene_threshold <= 1.0:
+        raise SystemExit(
+            f"--scene-threshold must be between 0 and 1 (got {args.scene_threshold})"
+        )
 
     config = get_config()
     detail = args.detail or str(config["detail"])
@@ -208,7 +303,11 @@ def main() -> int:
 
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
-        dl = fetch_captions(args.source, work / "download")
+        dl = fetch_captions(
+            args.source, work / "download",
+            cookies_from_browser=args.cookies_from_browser,
+            cookies_file=args.cookies,
+        )
         if dl.get("subtitle_path"):
             try:
                 transcript_segments = parse_vtt(dl["subtitle_path"])
@@ -217,6 +316,8 @@ def main() -> int:
             except Exception as exc:
                 print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
                 transcript_segments = []
+
+    refuse_if_live(dl.get("info") or {})
 
     # --timestamps and --motion both need the video for frame grabs, so either
     # overrides the transcript-mode download skip (and forces a full, not
@@ -238,6 +339,8 @@ def main() -> int:
                 args.source,
                 work / "download",
                 audio_only=audio_only,
+                cookies_from_browser=args.cookies_from_browser,
+                cookies_file=args.cookies,
             )
         else:
             print("[watch] using local file…", file=sys.stderr)
@@ -253,6 +356,39 @@ def main() -> int:
     }
     full_duration = meta["duration_seconds"]
     crop = validate_crop(crop, meta.get("width"), meta.get("height"))
+
+    # An .m4a, an .mp3, or any container with no decodable video stream used to
+    # abort with a raw ffmpeg dump, zero stdout and exit 1 — in the one case where
+    # the transcript path would have worked perfectly.
+    #
+    # `frame_source` rather than clearing `video_path`: the Whisper gate below
+    # requires `video_path` to be truthy, so nulling it here would also kill the
+    # transcript, i.e. delete the entire reason for the fallback. Every frame
+    # engine reads `frame_source`; everything audio reads `video_path`.
+    # A still image is not a video with a problem, it is a different kind of
+    # thing, and the useful answer is "read it directly" rather than a frame
+    # budget. Today it dies inside the mjpeg encoder with a raw ffmpeg trace and
+    # exit 1, which tells the reader nothing about what to do instead.
+    if str(meta.get("format_name") or "").endswith("_pipe"):
+        raise SystemExit(
+            f"{Path(video_path).name} is a still image, not a video — there is nothing "
+            "to sample over time. Read the file directly with the Read tool; it renders "
+            "as an image without going through /watch."
+        )
+
+    has_video = bool(meta.get("width") and meta.get("height"))
+    frame_source = video_path if has_video else None
+    # `audio_only` means *we asked yt-dlp for audio* because transcript detail
+    # covered the request — the source itself may be a perfectly ordinary video.
+    # Saying "this source has no video stream" there states something false about
+    # the video rather than about the run.
+    source_lacks_video = bool(video_path) and not has_video and not audio_only
+    if source_lacks_video:
+        print(
+            f"[watch] {Path(video_path).name} has no video stream — "
+            "no frames to extract, continuing with the transcript",
+            file=sys.stderr,
+        )
 
     start_sec = parse_time(args.start)
     end_sec = parse_time(args.end)
@@ -302,9 +438,9 @@ def main() -> int:
 
     # Transcript cues are pinned: extracted first and counted against the cap so
     # the detail engine never evicts the moments the user explicitly asked for.
-    if cue_timestamps and video_path:
+    if cue_timestamps and frame_source:
         cue_frames, cue_meta = extract_at_timestamps(
-            video_path,
+            frame_source,
             work / "frames",
             cue_timestamps,
             resolution=args.resolution,
@@ -325,15 +461,55 @@ def main() -> int:
     # Motion mode replaces the detail engines entirely. Dispatched BEFORE the
     # `detail != "transcript"` guard below so it can never become a silent no-op
     # under a detail mode — the failure that makes --fps useless today.
-    if args.motion and video_path:
+    if args.motion and frame_source:
         motion_cap = args.max_frames if args.max_frames is not None else MOTION_HARD_MAX
+        # Blocking, not advisory. The existing warning below fires only when the
+        # cap *thinned* the run — i.e. when it got cheaper — and it prints after
+        # the JPEGs are already on disk and about to be read.
+        source_fps = meta.get("fps")
+        if args.max_frames is None:
+            # An unknown frame rate is not a reason to skip the guard — it is a
+            # reason to assume the worst. motion_interval does no thinning
+            # without a rate, so the run extracts every source frame up to
+            # MOTION_HARD_MAX; estimating against the cap is exactly right.
+            if source_fps:
+                interval = motion_interval(effective_duration, source_fps, motion_cap)
+                estimated = (
+                    min(motion_cap, int(source_fps * effective_duration)) if interval == 0
+                    else int(effective_duration / interval)
+                )
+            else:
+                estimated = min(motion_cap, MOTION_HARD_MAX)
+            dims = frame_dimensions(meta.get("width"), meta.get("height"), args.resolution, crop)
+            per_frame = image_tokens(*dims) if dims else 0
+            estimated_tokens = estimated * per_frame
+            if per_frame and estimated_tokens > MOTION_TOKEN_CEILING:
+                raise SystemExit(
+                    f"--motion over {scope} would extract ~{estimated} frames at "
+                    f"{dims[0]}x{dims[1]} — roughly {estimated_tokens // 1000}k image tokens "
+                    f"to read, against a {MOTION_TOKEN_CEILING // 1000}k ceiling.\n"
+                    "Motion mode samples every source frame on purpose, so it wants one "
+                    "transition rather than a scene:\n"
+                    + (
+                        f"  * narrow the window — `--start`/`--end` around the transition "
+                        f"(at ~{source_fps:.0f} fps, "
+                        f"{MOTION_TOKEN_CEILING // max(1, per_frame) / source_fps:.1f}s fits)\n"
+                        if source_fps else
+                        "  * narrow the window — `--start`/`--end` around the transition "
+                        "(this source reports no frame rate, so the estimate assumes the "
+                        f"{MOTION_HARD_MAX}-frame cap)\n"
+                    ) +
+                    "  * or `--crop x,y,w,h` to isolate the moving component, which cuts "
+                    "the per-frame cost as well as making the motion measurable\n"
+                    f"  * or pass `--max-frames N` to accept the cost deliberately"
+                )
         print(
             f"[watch] motion: sampling source frames over {scope} "
             f"(source ~{meta.get('fps') or 0:.1f} fps, cap {min(motion_cap, MOTION_HARD_MAX)})…",
             file=sys.stderr,
         )
         frames, frame_meta = extract_motion(
-            video_path,
+            frame_source,
             work / "frames",
             start_seconds=effective_start,
             end_seconds=effective_end,
@@ -347,17 +523,32 @@ def main() -> int:
         motion_data_path = write_motion_data(
             work / "motion.json", frames, motion_env, frame_meta, meta, crop,
         )
-    elif detail != "transcript" and video_path and detail_budget != 0:
-        cap_label = "unlimited" if detail_budget is None else str(detail_budget)
+    elif args.motion:
+        # There was no else here, so --motion with no video produced zero frames
+        # and said nothing about it — the silent no-op this dispatch is ordered
+        # to prevent, reached by a different route. Both ways of having no pixels
+        # land here: no file at all, and a file with no video stream. The second
+        # one used to fall through and still print a full motion block — sampled
+        # fps, gap range, envelope — computed from an empty frame list.
+        raise SystemExit(
+            "--motion needs a video stream and this source has none "
+            f"({Path(video_path).name if video_path else 'no video file was resolved'}). "
+            "Point it at a local video file, or at the file printed in the footer of a "
+            "previous run's report."
+        )
+    elif detail != "transcript" and frame_source and detail_budget != 0:
+        cap_note = "uncapped" if detail_budget is None else f"cap {detail_budget}"
         engine_label = "keyframes" if detail == "efficient" else "scene-aware frames"
+        # No "target N" here: which engine runs is only known after detection,
+        # and the duration target binds solely on the uniform fallback. The
+        # report below states the cap and budget the engine actually applied.
         print(
-            f"[watch] extracting {engine_label} over {scope} "
-            f"(target {target}, cap {cap_label})…",
+            f"[watch] extracting {engine_label} over {scope} ({cap_note})…",
             file=sys.stderr,
         )
         if detail == "efficient":
             frames, frame_meta = extract_keyframes(
-                video_path,
+                frame_source,
                 work / "frames",
                 resolution=args.resolution,
                 max_frames=detail_budget,
@@ -368,7 +559,7 @@ def main() -> int:
             )
         else:  # balanced, token-burner
             frames, frame_meta = extract_scene_or_uniform(
-                video_path,
+                frame_source,
                 work / "frames",
                 fps=fps,
                 target_frames=target,
@@ -378,7 +569,39 @@ def main() -> int:
                 end_seconds=end_sec,
                 dedup=not args.no_dedup,
                 crop=crop,
+                scene_threshold=(
+                    args.scene_threshold if args.scene_threshold is not None
+                    else SCENE_THRESHOLD
+                ),
             )
+
+    # --scene-threshold has no meaning outside the scene engine: the keyframe
+    # engine asks the decoder which frames are I-frames and never computes a
+    # scene metric at all, and motion mode takes every frame. Same rule as --fps
+    # below — this codebase treats a silently ignored flag as a bug.
+    if args.scene_threshold is not None and (args.motion or detail == "efficient"):
+        why = "--motion samples every source frame" if args.motion else (
+            "--detail efficient selects keyframes, which the decoder marks and "
+            "which carry no scene score"
+        )
+        print(
+            f"[watch] --scene-threshold {args.scene_threshold} had no effect: {why}. "
+            "It binds only on `--detail balanced` and `--detail token-burner`.",
+            file=sys.stderr,
+        )
+
+    # --fps reaches only the uniform fallback: the scene and keyframe engines
+    # select on content, not at a sample rate. Say so rather than accepting the
+    # flag and ignoring it — a silent no-op here is the same failure the motion
+    # dispatch above is deliberately ordered to avoid.
+    if args.fps is not None and not args.motion and frame_meta.get("engine") in ("scene", "keyframe"):
+        print(
+            f"[watch] --fps {args.fps} had no effect: the {frame_meta['engine']} engine picks frames by "
+            "content, not at a fixed rate, and --fps binds only on the uniform fallback. Use "
+            "--max-frames to change how many frames you get, --detail token-burner to keep every "
+            "detected frame, or --start/--end to sample a window densely.",
+            file=sys.stderr,
+        )
 
     if cue_frames:
         frames = merge_frames(frames, cue_frames)
@@ -402,6 +625,11 @@ def main() -> int:
                     work / "audio.mp3",
                     backend=backend,
                     api_key=api_key,
+                    # Encode and upload only the window. The segments come back
+                    # already shifted into absolute source time, which is what
+                    # filter_range below selects on.
+                    start_seconds=start_sec,
+                    end_seconds=end_sec,
                 )
                 transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
                 transcript_text = format_transcript(transcript_segments)
@@ -459,10 +687,19 @@ def main() -> int:
         sampled = frame_meta.get("sampled_fps")
         lo, hi = frame_meta.get("min_gap_ms"), frame_meta.get("max_gap_ms")
         source_note = f"source ~{src:.1f} fps" if src else "source rate unknown"
-        coverage = (
-            "every source frame" if not frame_meta.get("interval")
-            else f"thinned to 1 frame per {frame_meta['interval'] * 1000:.0f} ms"
-        )
+        # `interval` covers thinning decided up front from the fps probe;
+        # `even_sampled` covers thinning done afterwards because the probe was
+        # wrong and the cap bit anyway. Claiming "every source frame" while the
+        # second one happened describes a run that discarded most of its frames.
+        if frame_meta.get("interval"):
+            coverage = f"thinned to 1 frame per {frame_meta['interval'] * 1000:.0f} ms"
+        elif frame_meta.get("even_sampled"):
+            coverage = (
+                f"thinned to {frame_meta.get('selected_count')} of "
+                f"{frame_meta.get('candidate_count')} source frames"
+            )
+        else:
+            coverage = "every source frame"
         print(
             f"- **Motion window:** {format_time_ms(effective_start)} → "
             f"{format_time_ms(effective_end)} ({effective_duration:.3f}s)"
@@ -479,8 +716,30 @@ def main() -> int:
                 f"**{motion_env['duration_ms']:.0f} ms**, peak at "
                 f"{format_time_ms(motion_env['peak_at'])}"
             )
+            # A duration that stops at the edge of the window is a lower bound,
+            # and saying so is the whole point: the docs tell you to use a tight
+            # window, and a tight window is exactly what truncates the answer.
+            edges = [
+                name for name, flag in (
+                    ("start", motion_env.get("clipped_start")),
+                    ("end", motion_env.get("clipped_end")),
+                ) if flag
+            ]
+            if edges:
+                where = " and ".join(edges)
+                print(
+                    f"- **Envelope clipped:** motion was already underway at the {where} of the "
+                    f"window, so {motion_env['duration_ms']:.0f} ms is a **lower bound**, not the "
+                    "duration. Widen `--start`/`--end` past the transition on that side and re-run."
+                )
         else:
-            print("- **Motion envelope:** no change detected above the noise floor")
+            print(
+                "- **Motion envelope:** no change detected — the largest run of change in this "
+                f"window totalled {motion_env.get('event_change', 0.0):.1f}, under the "
+                f"{motion_env.get('min_change') or 0.0:.1f} needed to count as motion "
+                f"(thumbnail-cell units, 0-255; per-frame noise floor "
+                f"{motion_env.get('floor') or 0.0:.1f})"
+            )
         if motion_data_path:
             print(f"- **Motion data:** `{motion_data_path}` (per-frame times and change signal)")
         if frame_meta.get("even_sampled") or frame_meta.get("interval"):
@@ -494,16 +753,64 @@ def main() -> int:
                 f"> **Warning:** the window exceeded the {frame_meta.get('cap')}-frame cap and was "
                 "thinned. Narrow `--start`/`--end` to capture every frame."
             )
+    elif source_lacks_video:
+        # Reported as a property of the source, not as a failure of the run: the
+        # transcript below is a complete answer for an audio file, and this used
+        # to be a raw ffmpeg dump on stderr with exit 1 and no stdout at all.
+        print(
+            "- **Frames:** none — this source has no video stream "
+            f"({'audio only' if meta.get('has_audio') else 'no decodable streams'}). "
+            "The transcript below is the whole report."
+        )
     elif detail != "transcript":
-        cap_label = "unlimited" if detail_budget is None else str(detail_budget)
         engine = frame_meta.get("engine", "scene")
-        fallback = " with uniform fallback" if frame_meta.get("fallback") else ""
+        # The fallback engine is already named "uniform"; appending "with uniform
+        # fallback" to it printed "uniform with uniform fallback".
+        if frame_meta.get("fallback"):
+            shots = frame_meta.get("scene_count")
+            why = f", too few shots ({shots})" if shots is not None else ""
+            engine = f"{engine} fallback{why}"
+        fallback = ""
         deduped = frame_meta.get("deduped_count", 0)
         dedup_note = f", {deduped} near-duplicate{'s' if deduped != 1 else ''} dropped" if deduped else ""
+        # Say when frames were added, or the count silently disagrees with the
+        # candidate count and the reader has no way to tell which frames landed
+        # on a cut and which were placed to cover a hole.
+        filled = frame_meta.get("gap_filled", 0)
+        fill_note = f", {filled} added to fill gaps" if filled else ""
+        # Cap and budget are read back from the engine that ran, not from the
+        # duration `target` computed above. `target`/`fps` reach only the uniform
+        # fallback, so the old unconditional "budget {target}" described a code
+        # path that had not executed on any scene- or keyframe-engine run — the
+        # number was real, it just governed nothing.
+        effective_cap = frame_meta.get("effective_cap", detail_budget)
+        cap_note = "uncapped" if effective_cap is None else f"cap {effective_cap}"
+        engine_budget = frame_meta.get("budget")
+        budget_note = f", budget {engine_budget}" if engine_budget is not None else ""
         print(
             f"- **Frames:** {detail_count} selected from {frame_meta.get('candidate_count', detail_count)} "
-            f"candidates ({engine}{fallback}{dedup_note}, {range_mode} range, budget {target}, cap {cap_label})"
+            f"candidates ({engine}{fallback}{dedup_note}{fill_note}, {range_mode} range{budget_note}, {cap_note})"
         )
+        # Cut rhythm, from the full detected list rather than from whichever
+        # frames survived sampling. Reading the gaps between kept frames as shot
+        # lengths under-counted a fast-cut clip by 12x — and looked authoritative
+        # doing it, because the timestamps themselves were correct.
+        shots = frame_meta.get("shots") or {}
+        if shots.get("cuts"):
+            rate = f"{shots['per_minute']:.1f}/min" if shots.get("per_minute") else "rate unknown"
+            print(
+                f"- **Shots:** {shots['cuts']} cuts, {rate} — median {shots['median_s']:.2f}s, "
+                f"p10 {shots['p10_s']:.2f}s, p90 {shots['p90_s']:.2f}s "
+                f"(shortest {shots['shortest_s']:.2f}s, longest {shots['longest_s']:.2f}s)"
+            )
+            if deduped:
+                print(
+                    f"  Counted before near-duplicate removal, so up to {deduped} of these "
+                    "may be cuts between visually similar shots rather than distinct ones."
+                )
+            if detail == "token-burner":
+                times = ", ".join(format_time_ms(t) for t in shots["cut_times"])
+                print(f"  Cuts at: {times}")
     elif not cue_frames:
         print("- **Frames:** skipped (transcript detail)")
     if cue_frames:
@@ -549,8 +856,12 @@ def main() -> int:
         print()
         print(
             "**Read each frame path below with the Read tool to view the image.** "
-            "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source "
-            "video (`MM:SS.mmm` on precision-targeted frames, where several can share a second)."
+            "Frames are in chronological order; `t=MM:SS.mmm` is the absolute timestamp in the "
+            "source video. `scene-change`, `first-frame`, `keyframe` and `motion` frames carry "
+            "ffmpeg's measured presentation time. `transcript-cue` and `gap-fill` frames carry "
+            "the time that was *requested* — the decoder returns the nearest frame at or after "
+            "it. `uniform` frames carry the time the sampler asked for, which can be early by "
+            "up to half its sampling interval."
         )
         print()
         for frame in frames:
@@ -582,6 +893,19 @@ def main() -> int:
         )
     elif focused and dl.get("subtitle_path"):
         print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
+    elif source_lacks_video:
+        # "Proceed with frames only" is the standard advice and it is nonsense
+        # here: this source has no frames either, so following it would send the
+        # reader looking for images that do not exist. On an audio-only source a
+        # missing transcript means the run produced nothing at all, and the
+        # report should say that rather than imply a fallback.
+        setup_py = SCRIPT_DIR / "setup.py"
+        print(
+            "_No transcript available, and this source has no video stream — so there is "
+            "nothing to report. Captions were missing and the Whisper fallback was "
+            "unavailable (no API key set, or `--no-whisper` was used). "
+            f"Run `python3 {setup_py}` to enable Whisper, then re-run._"
+        )
     else:
         setup_py = SCRIPT_DIR / "setup.py"
         print(
@@ -594,6 +918,12 @@ def main() -> int:
     print()
     print("---")
     print(f"_Work dir: `{work}` — delete when done._")
+    if video_path:
+        # The resolved path, not a guessed one. yt-dlp writes `video.%(ext)s`, so
+        # the extension depends on what the site served — .webm and .mkv are
+        # routine — and every doc that hardcoded `download/video.mp4` for the
+        # second pass broke on exactly those.
+        print(f"_Video file: `{video_path}` — pass this to a second run, not the URL._")
 
     return 0
 

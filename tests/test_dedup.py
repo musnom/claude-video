@@ -160,3 +160,85 @@ def test_dedup_false_disables_collapse(static_clip: Path, tmp_path: Path):
     assert meta["deduped_count"] == 0
     assert meta["selected_count"] > 1  # no collapse without dedup
     assert len(out) > 1
+
+
+# --- localised change survives dedup ------------------------------------------
+# frames.py's module docstring promised "a code diff / scrolling terminal /
+# slide-gaining-a-bullet survives". Thresholding the mean alone, it did not: a
+# change confined to a few of the 256 thumbnail cells barely moves a whole-frame
+# average, so the tool deleted exactly the frames a reader needed and reported
+# them as near-duplicates.
+
+
+def test_a_slide_gaining_one_line_is_not_a_near_duplicate(slide_deck_clip: Path, tmp_path: Path):
+    """The promise in the docstring, as a test.
+
+    Measured on these frames: mean 1.42-1.77 (all under DEDUP_THRESHOLD = 2.0, so
+    the old rule dropped every build) against peak 55-70.
+    """
+    from conftest import slide_deck_state_times
+
+    states, _ = frames.extract_at_timestamps(
+        str(slide_deck_clip), tmp_path / "f", slide_deck_state_times(), resolution=512,
+    )
+    assert len(states) == 5
+    thumbs = frames._thumb_frames([Path(f["path"]) for f in states])
+    deltas = [frames._cell_deltas(thumbs[i], thumbs[i - 1]) for i in range(1, len(thumbs))]
+
+    # The premise: invisible to the mean, obvious to the peak. If this ever stops
+    # holding the fixture has drifted and the test below proves nothing.
+    assert all(mean < frames.DEDUP_THRESHOLD for mean, _ in deltas), deltas
+    assert all(peak > frames.DEDUP_PEAK_THRESHOLD for _, peak in deltas), deltas
+
+    survivors, dropped = frames._dedupe_by_deltas(states, thumbs)
+    assert dropped == 0
+    assert len(survivors) == 5
+
+
+def test_five_state_deck_returns_five_frames_end_to_end(slide_deck_clip: Path, tmp_path: Path):
+    """The user-visible bug: a 5-state deck came back as 3 frames, with states 2
+    and 4 deleted and the loss reported as "near-duplicates dropped"."""
+    out, meta = frames.extract_scene_or_uniform(
+        str(slide_deck_clip), tmp_path / "f", fps=2.0, target_frames=20, max_frames=100,
+    )
+    stamps = [f["timestamp_seconds"] for f in out]
+    # One frame per state at least, and each state represented.
+    assert len(out) >= 5, stamps
+    for state in range(5):
+        lo, hi = state * 2.0, (state + 1) * 2.0
+        assert any(lo <= t < hi for t in stamps), f"state {state} missing from {stamps}"
+
+
+def test_peak_rule_does_not_stop_identical_frames_collapsing(static_clip: Path, tmp_path: Path):
+    """The other half of the contract. Keeping localised change is only useful if
+    genuinely identical frames still go away — otherwise the budget goes on a
+    held slide."""
+    out = frames.extract(str(static_clip), tmp_path / "f", fps=4.0, max_frames=10)
+    survivors, dropped = frames.dedupe_perceptual(out)
+    assert len(survivors) == 1
+    assert dropped == len(out) - 1
+
+
+def test_dedup_fails_open_on_ragged_thumbnails(tmp_path: Path):
+    """_frame_delta returns inf on ragged input (frame kept); _cell_deltas returns
+    (0.0, 0.0), which would DELETE it. The rule reads the second helper now, so
+    the inversion has to be handled explicitly or a decode hiccup starts eating
+    frames."""
+    cands = _touch(tmp_path, 3)
+    thumbs = [FLAT0, b"\x00\x10", FLAT0]      # middle thumb is the wrong length
+    survivors, dropped = frames._dedupe_by_deltas(cands, thumbs)
+    assert dropped == 0
+    assert len(survivors) == 3
+    assert len(list(tmp_path.glob("frame_*.jpg"))) == 3
+
+
+def test_peak_alone_is_enough_to_keep_a_frame(tmp_path: Path):
+    """Mean says duplicate, peak says otherwise, and the frame survives — one
+    cell of 256 changing by 200 is a control changing state."""
+    cands = _touch(tmp_path, 2)
+    a = bytes([100] * 256)
+    b = bytearray(a)
+    b[0] = 255                                 # mean moves 0.6, peak moves 155
+    survivors, dropped = frames._dedupe_by_deltas(cands, [a, bytes(b)])
+    assert dropped == 0
+    assert len(survivors) == 2

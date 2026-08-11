@@ -115,13 +115,39 @@ def test_cue_frame_labels_have_millisecond_precision(cut_clip: Path):
     assert all("." in s for s in stamps), stamps
 
 
-def test_non_cue_frame_labels_stay_whole_seconds(cut_clip: Path):
-    """No-default-change guard: scene/keyframe/uniform labels are unchanged."""
+def test_detail_frame_labels_carry_milliseconds(cut_clip: Path):
+    """Was a guard that scene/keyframe/uniform labels stay whole seconds.
+
+    That contract is now inverted, deliberately. Whole seconds cannot describe a
+    clip that cuts more than once a second, and on a 120-shot clip that fit under
+    the frame cap 20% of consecutive frames printed the identical timestamp — so
+    the label stopped identifying the frame it was attached to. cut_clip cuts
+    every 0.4s, which is exactly that regime.
+    """
     for detail in ("balanced", "efficient"):
         out = _run(cut_clip, "--detail", detail)
         stamps = re.findall(r"\(t=([0-9:.]+), reason=", out)
         assert stamps, out
-        assert not any("." in s for s in stamps), f"{detail}: {stamps}"
+        assert all("." in s for s in stamps), f"{detail}: {stamps}"
+        assert len(set(stamps)) == len(stamps), f"{detail}: labels collapsed: {stamps}"
+
+
+def test_frame_labels_still_agree_with_the_transcript_clock(cut_clip: Path):
+    """Finer labels must not become a second, competing clock.
+
+    format_time is shared with transcribe.format_transcript so frame and
+    transcript stamps line up; format_time_ms is that same value one order finer.
+    Re-coarsening any frame label has to land back on the transcript's clock.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(WATCH.parent))
+    from frames import format_time, parse_time
+
+    out = _run(cut_clip, "--detail", "balanced")
+    stamps = re.findall(r"\(t=([0-9:.]+), reason=", out)
+    assert stamps
+    for stamp in stamps:
+        assert format_time(parse_time(stamp)) == format_time(round(parse_time(stamp)))
 
 
 # --- motion mode --------------------------------------------------------------
@@ -217,9 +243,24 @@ def test_motion_writes_stack_agnostic_data(slide_clip: Path, tmp_path):
     assert data["envelope"]["duration_ms"] == pytest.approx(300, abs=20)
 
     first = data["frames"][0]
-    assert set(first) == {"i", "t", "gap_ms", "mean_delta", "peak_delta", "path"}
+    assert set(first) == {"i", "t", "gap_ms", "mean_delta", "peak_delta", "cum_delta", "path"}
     assert first["gap_ms"] is None
     assert all(f["gap_ms"] is not None for f in data["frames"][1:])
+    # The cumulative curve is what the envelope is read off, so it has to be
+    # monotone: a consumer plotting it is plotting "how much has changed so far".
+    cum = [f["cum_delta"] for f in data["frames"]]
+    assert cum[0] == 0.0
+    assert all(b >= a for a, b in zip(cum, cum[1:])), cum
+
+    # Both envelope branches return the same keys. They used to differ (4 on no
+    # motion, 6 on motion) and the asymmetry leaked into this file.
+    assert set(data["envelope"]) == {
+        "first_motion", "last_motion", "duration_ms", "peak_at", "peak_delta",
+        "total_change", "event_change", "floor", "min_change",
+        "clipped_start", "clipped_end",
+    }
+    assert data["envelope"]["clipped_start"] is False
+    assert data["envelope"]["clipped_end"] is False
 
     blob = json.dumps(data).lower()
     for leak in ("cubic-bezier", "keyframe", "ease-in", "css", "framer"):
@@ -240,3 +281,303 @@ def test_motion_json_records_the_crop(slide_clip: Path, tmp_path):
     _run(slide_clip, "--motion", "--crop", "40,150,500,60", "--out-dir", str(out_dir))
     data = json.loads((out_dir / "motion.json").read_text())
     assert data["crop"] == {"x": 40, "y": 150, "w": 500, "h": 60}
+
+
+def test_motion_report_warns_when_the_window_clips_the_envelope(slide_clip: Path):
+    """A duration that stops at the window edge is a lower bound. The report has
+    to say so, because the motion workflow tells the reader to state the measured
+    number and this is the case where that number is wrong by construction."""
+    out = _run(slide_clip, "--motion", "--start", "1.0", "--end", "1.3")
+    assert "Envelope clipped:" in out
+    assert "lower bound" in out
+
+
+def test_motion_report_is_quiet_when_the_window_contains_the_whole_move(slide_clip: Path):
+    out = _run(slide_clip, "--motion", "--start", "0.5", "--end", "2.0")
+    assert "Motion envelope:" in out
+    assert "Envelope clipped:" not in out
+
+
+def test_motion_end_to_end_on_an_eased_move(eased_clip_cubic: Path):
+    """The Phase 1 end-to-end gate: a cubic ease-out through watch.py's own
+    report. 433ms, not the nominal 500 — see test_fixtures.py for why the last
+    67ms of an ease-out is not in the pixels."""
+    out = _run(eased_clip_cubic, "--motion", "--start", "0.9", "--end", "1.6")
+    match = re.search(r"\*\*(\d+) ms\*\*", out)
+    assert match, out
+    assert 410 <= int(match.group(1)) <= 460, out
+    assert "Envelope clipped:" not in out
+
+
+def test_motion_report_quantifies_a_no_change_verdict(static_clip: Path):
+    """"No change detected" used to be unfalsifiable. It now carries the number
+    it was compared against, so a reader can tell a still clip from a threshold
+    that is set wrong."""
+    out = _run(static_clip, "--motion", "--start", "0.5", "--end", "1.5")
+    assert "no change detected" in out
+    # The number the verdict was decided against, not a different one that was
+    # never compared with it.
+    assert "to count as motion" in out
+    assert "noise floor" in out
+
+
+# --- scene threshold and gap fill ----------------------------------------------
+
+
+def test_graphic_cuts_report_shots_instead_of_a_uniform_fallback(graphic_cuts_clip: Path):
+    """UC3's primary input. This used to print
+    "1 selected from 1 candidates (uniform fallback, too few shots (1) …)"."""
+    out = _run(graphic_cuts_clip, "--detail", "balanced")
+    assert "(scene" in out
+    assert "uniform fallback" not in out
+    assert "reason=scene-change" in out
+
+
+def test_scene_threshold_flag_changes_what_counts_as_a_cut(graphic_cuts_clip: Path):
+    out = _run(graphic_cuts_clip, "--detail", "balanced", "--scene-threshold", "0.2")
+    assert "uniform fallback" in out
+
+
+def test_scene_threshold_is_rejected_when_out_of_range(cut_clip: Path):
+    proc = subprocess.run(
+        [sys.executable, str(WATCH), str(cut_clip), "--no-whisper", "--scene-threshold", "5"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode != 0
+    assert "between 0 and 1" in proc.stderr
+
+
+@pytest.mark.parametrize(
+    "extra,why",
+    [
+        (["--detail", "efficient"], "keyframes"),
+        (["--motion", "--start", "1", "--end", "1.2"], "every source frame"),
+    ],
+)
+def test_scene_threshold_says_so_when_it_does_nothing(motion_clip: Path, extra, why):
+    """A silently ignored flag is treated as a bug in this codebase — the same
+    rule --fps and --motion already follow."""
+    proc = subprocess.run(
+        [sys.executable, str(WATCH), str(motion_clip), "--no-whisper",
+         "--scene-threshold", "0.1", *extra],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--scene-threshold 0.1 had no effect" in proc.stderr
+    assert why in proc.stderr
+
+
+def test_gap_fill_is_reported_not_silent(sparse_cuts_clip: Path):
+    """88 of 100 frames placed by the tool rather than found by detection is not
+    a detail to leave out of the line that says where the frames came from."""
+    out = _run(sparse_cuts_clip, "--detail", "balanced")
+    assert "added to fill gaps" in out
+    assert "reason=gap-fill" in out
+    assert "reason=scene-change" in out
+
+
+def test_report_states_the_cut_rhythm(fast_cut_clip: Path):
+    """`--detail balanced` caps at 100 frames; the shot line has to describe the
+    video regardless of how many frames survived that cap."""
+    out = _run(fast_cut_clip, "--detail", "balanced", "--max-frames", "6")
+    match = re.search(r"\*\*Shots:\*\* (\d+) cuts, ([0-9.]+)/min — median ([0-9.]+)s", out)
+    assert match, out
+    cuts, per_minute, median = int(match.group(1)), float(match.group(2)), float(match.group(3))
+    assert cuts >= 20, out
+    assert 100 <= per_minute <= 130, out
+    assert 0.45 <= median <= 0.55, out
+
+
+def test_shot_line_is_absent_when_there_are_no_shots(static_clip: Path):
+    out = _run(static_clip, "--detail", "balanced")
+    assert "**Shots:**" not in out
+
+
+def test_token_burner_lists_every_cut(fast_cut_clip: Path):
+    out = _run(fast_cut_clip, "--detail", "token-burner")
+    assert "Cuts at:" in out
+    times = re.search(r"Cuts at: (.+)", out).group(1).split(", ")
+    assert len(times) >= 20
+    assert all("." in t for t in times), times[:3]
+
+
+# --- guards --------------------------------------------------------------------
+# Three ways a run used to end badly: an unbounded --motion window that produced
+# hundreds of thousands of image tokens without warning, a live URL that made
+# yt-dlp record forever, and an audio-only file that aborted with a raw ffmpeg
+# dump in the one case where the transcript path would have worked.
+
+
+def _run_expecting_failure(clip: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(WATCH), str(clip), "--no-whisper", *args],
+        capture_output=True, text=True,
+    )
+
+
+def test_motion_refuses_an_unbounded_window(sparse_cuts_clip: Path):
+    """A 12-minute clip with no --start/--end hits the 2000-frame cap, which at
+    320x240 is ~204k image tokens — and the frames exist by the time any warning
+    could print, so this has to block rather than warn."""
+    proc = _run_expecting_failure(sparse_cuts_clip, "--motion")
+    assert proc.returncode != 0
+    assert "image tokens" in proc.stderr
+    assert "ceiling" in proc.stderr
+    # Actionable, not just a refusal.
+    assert "--start" in proc.stderr and "--crop" in proc.stderr and "--max-frames" in proc.stderr
+
+
+def test_motion_allows_an_explicit_frame_budget(sparse_cuts_clip: Path):
+    """--max-frames means the user named the number, so the guard stands down."""
+    out = _run(sparse_cuts_clip, "--motion", "--max-frames", "40")
+    assert "reason=motion" in out
+
+
+def test_motion_allows_a_tight_window(slide_clip: Path):
+    out = _run(slide_clip, "--motion", "--start", "0.9", "--end", "1.6")
+    assert "Motion envelope:" in out
+
+
+def test_audio_only_input_returns_a_report_instead_of_an_ffmpeg_dump(tmp_path: Path):
+    """`.m4a` used to exit 1 with zero stdout and a raw ffmpeg trace on stderr."""
+    audio = tmp_path / "voice.m4a"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-t", "2", "-i", "sine=frequency=440:sample_rate=16000",
+         "-c:a", "aac", str(audio)],
+        check=True, capture_output=True,
+    )
+    proc = _run_expecting_failure(audio)
+    assert proc.returncode == 0, proc.stderr
+    assert "no video stream" in proc.stdout
+    assert "# watch: video report" in proc.stdout
+    assert "Traceback" not in proc.stderr
+
+
+def test_still_image_gets_an_answer_not_an_encoder_error(tmp_path: Path):
+    """A .png has a real width and height, so the audio-only path does not catch
+    it; it died inside the mjpeg encoder instead. The useful answer is that
+    /watch is the wrong tool for it."""
+    image = tmp_path / "shot.png"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "color=c=teal:s=320x240", "-frames:v", "1", str(image)],
+        check=True, capture_output=True,
+    )
+    proc = _run_expecting_failure(image)
+    assert proc.returncode != 0
+    assert "still image" in proc.stderr
+    assert "Read the file directly" in proc.stderr
+    assert "ff_frame_thread_encoder_init" not in proc.stderr
+
+
+# --- live streams --------------------------------------------------------------
+# Only reachable end-to-end with a live URL, which this suite cannot use, so the
+# decision is asserted directly against the info dicts yt-dlp really emits.
+
+
+def test_live_stream_is_refused():
+    import watch
+    with pytest.raises(SystemExit, match="live broadcast"):
+        watch.refuse_if_live({"is_live": True, "live_status": "is_live"})
+
+
+def test_live_flag_alone_is_enough():
+    """Some extractors set is_live without live_status."""
+    import watch
+    with pytest.raises(SystemExit, match="live broadcast"):
+        watch.refuse_if_live({"is_live": True})
+
+
+def test_upcoming_stream_is_refused():
+    import watch
+    with pytest.raises(SystemExit, match="has not started"):
+        watch.refuse_if_live({"is_live": False, "live_status": "is_upcoming"})
+
+
+def test_finished_stream_still_processing_is_allowed():
+    """post_live is a bounded artifact — the broadcast ended and the platform is
+    still assembling the VOD. Refusing it would reject a normal recording."""
+    import watch
+    watch.refuse_if_live({"is_live": False, "live_status": "post_live"})
+
+
+@pytest.mark.parametrize("info", [{}, {"live_status": "not_live"}, {"live_status": "was_live"}, {"is_live": False}])
+def test_non_live_info_passes(info):
+    """An empty dict is a normal outcome: fetch_captions passes --ignore-errors
+    and never checks yt-dlp's return code, so "no info" must not read as "live"."""
+    import watch
+    watch.refuse_if_live(info)
+
+
+# --- regressions found by review, not by the suite ----------------------------
+
+
+def test_motion_on_a_source_with_no_video_stream_says_so(tmp_path: Path):
+    """--motion on an audio file used to run no extractor at all and then print a
+    full motion block anyway — sampled fps, gap range, envelope — computed from an
+    empty frame list. Exactly the "report describes a code path that did not run"
+    failure this whole change exists to remove."""
+    audio = tmp_path / "voice.m4a"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-t", "2", "-i", "sine=frequency=440:sample_rate=16000",
+         "-c:a", "aac", str(audio)],
+        check=True, capture_output=True,
+    )
+    proc = subprocess.run(
+        [sys.executable, str(WATCH), str(audio), "--no-whisper", "--motion"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode != 0
+    assert "needs a video stream" in proc.stderr
+    assert "Motion envelope" not in proc.stdout
+
+
+def test_report_states_the_shot_rate_over_the_clip_not_the_cut_span(tmp_path: Path):
+    """End to end: a clip that cuts eight times in four seconds and then holds.
+
+    The rate used to be computed over the span between the first and last cut, so
+    26 seconds of static card were excluded from the denominator and the report
+    called it 120 cuts/min.
+    """
+    clip = tmp_path / "front_loaded.mp4"
+    inputs = []
+    colors = ["red", "green", "blue", "white", "black", "yellow", "cyan", "magenta"]
+    for color in colors:
+        inputs += ["-f", "lavfi", "-t", "0.5", "-i", f"color=c={color}:s=320x240:r=30"]
+    inputs += ["-f", "lavfi", "-t", "26", "-i", "color=c=navy:s=320x240:r=30"]
+    n = len(colors) + 1
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *inputs,
+         "-filter_complex", "".join(f"[{i}:v]" for i in range(n)) + f"concat=n={n}:v=1:a=0[out]",
+         "-map", "[out]", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-force_key_frames", "0.5,1,1.5,2,2.5,3,3.5,4", str(clip)],
+        check=True, capture_output=True,
+    )
+    out = _run(clip, "--detail", "balanced")
+    match = re.search(r"\*\*Shots:\*\* (\d+) cuts, ([0-9.]+)/min.*longest ([0-9.]+)s", out)
+    assert match, out
+    cuts, per_minute, longest = int(match.group(1)), float(match.group(2)), float(match.group(3))
+    # 30s clip: whatever the detector counted, the rate is that over 30s.
+    assert per_minute == pytest.approx(cuts / 0.5, abs=0.5), out
+    assert per_minute < 25, f"a 30s clip with {cuts} cuts is not {per_minute}/min"
+    # ...and the 26s closing shot is the longest one, not a 0.5s colour block.
+    assert longest > 20, out
+
+
+def test_audio_only_report_does_not_advise_reading_frames_that_do_not_exist(tmp_path: Path):
+    """"No transcript — proceed with frames only" is the standard fallback line
+    and it is nonsense on a source that has no frames either. Following it sends
+    the reader looking for images that were never produced."""
+    audio = tmp_path / "voice.m4a"
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-t", "2", "-i", "sine=frequency=440:sample_rate=16000",
+         "-c:a", "aac", str(audio)],
+        check=True, capture_output=True,
+    )
+    out = _run(audio)
+    assert "no video stream" in out
+    assert "proceed with frames only" not in out
+    assert "nothing to report" in out

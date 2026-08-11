@@ -444,3 +444,331 @@ def test_envelope_start_is_the_frame_before_the_change():
 def test_cell_deltas_handles_mismatched_thumbs():
     assert frames._cell_deltas(b"", b"") == (0.0, 0.0)
     assert frames._cell_deltas(b"\x00\x10", b"\x00") == (0.0, 0.0)
+
+
+# --- cumulative change --------------------------------------------------------
+# The envelope is read off a monotone "how much has changed since the window
+# opened" curve rather than off each frame's own delta. These pin the curve's
+# shape, because every envelope assertion below is only as good as it is.
+
+
+def test_cum_delta_is_monotone_and_flat_outside_the_move(slide_clip: Path, tmp_path):
+    """Rises only while the box is moving, never falls, and stops when it stops."""
+    extracted, _ = frames.extract_motion(
+        str(slide_clip), tmp_path, 0.0, 2.5, source_fps=60.0
+    )
+    measured = frames.measure_motion(extracted)
+    cum = [f["cum_delta"] for f in measured]
+
+    assert cum[0] == 0.0
+    assert all(b >= a for a, b in zip(cum, cum[1:])), "curve must never fall"
+
+    before = [f["cum_delta"] for f in measured if f["timestamp_seconds"] < 0.98]
+    after = [f["cum_delta"] for f in measured if f["timestamp_seconds"] > 1.32]
+    assert max(before) == 0.0, "nothing moved before t=1.0"
+    assert len(set(after)) == 1, f"curve still climbing after the move: {sorted(set(after))[:5]}"
+    # ...and it actually went somewhere in between.
+    assert cum[-1] > 100
+
+
+def test_cum_delta_stays_flat_on_a_static_clip(static_clip: Path, tmp_path):
+    extracted, _ = frames.extract_motion(
+        str(static_clip), tmp_path, 0.0, 2.0, source_fps=10.0
+    )
+    measured = frames.measure_motion(extracted)
+    assert max(f["cum_delta"] for f in measured) == 0.0
+
+
+def test_cum_delta_is_present_on_the_no_thumbnail_path(monkeypatch, motion_clip: Path, tmp_path):
+    """Fail-open: when thumbnails are unavailable the key is 0.0, never absent.
+
+    _thumb_frames returns [] on any decode hiccup, and a consumer of motion.json
+    should not have to tell "no change" apart from "no key".
+    """
+    extracted, _ = frames.extract_motion(
+        str(motion_clip), tmp_path, 1.0, 1.2, source_fps=60.0
+    )
+    monkeypatch.setattr(frames, "_thumb_frames", lambda paths: [])
+    measured = frames.measure_motion(extracted)
+    assert all(f["cum_delta"] == 0.0 for f in measured)
+    assert frames.motion_envelope(measured)["first_motion"] is None
+
+
+def test_envelope_returns_the_same_keys_whether_or_not_it_found_motion(
+    slide_clip: Path, static_clip: Path, tmp_path
+):
+    """The two branches used to return 4 keys and 6, and the asymmetry leaked
+    straight into motion.json."""
+    moving, _ = frames.extract_motion(str(slide_clip), tmp_path / "a", 0.0, 2.5, source_fps=60.0)
+    still, _ = frames.extract_motion(str(static_clip), tmp_path / "b", 0.0, 2.0, source_fps=10.0)
+    found = frames.motion_envelope(frames.measure_motion(moving))
+    none = frames.motion_envelope(frames.measure_motion(still))
+    assert set(found) == set(none)
+    assert found["first_motion"] is not None and none["first_motion"] is None
+
+
+# --- eased motion -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "clip_name,observable_ms",
+    [("eased_clip_cubic", 433.0), ("eased_clip_quintic", 350.0)],
+)
+def test_envelope_recovers_the_observable_duration_of_an_eased_move(
+    clip_name, observable_ms, tmp_path, request
+):
+    """An ease-out's nominal duration is 500ms; its *pixel-observable* duration
+    is shorter, and the honest answer is the one in the pixels.
+
+    tests/test_fixtures.py proves the clips stop moving at t=1.4333 (cubic) and
+    t=1.3500 (quintic) — the tail velocity falls under one source pixel per frame
+    long before the nominal end, so the last 67/150 ms are simply not recorded.
+    This asserts the envelope reports what happened rather than the number the
+    animation was authored with.
+    """
+    clip = request.getfixturevalue(clip_name)
+    extracted, _ = frames.extract_motion(str(clip), tmp_path, 0.0, 2.5, source_fps=60.0)
+    env = frames.motion_envelope(frames.measure_motion(extracted))
+    assert env["first_motion"] == pytest.approx(1.0, abs=0.02)
+    assert env["duration_ms"] == pytest.approx(observable_ms, abs=20)
+    assert env["clipped_start"] is False and env["clipped_end"] is False
+
+
+def test_eased_and_linear_moves_are_told_apart_by_where_the_change_lands(
+    eased_clip_cubic: Path, slide_clip: Path, tmp_path
+):
+    """The curve's *shape*, not just its span, is what makes easing readable.
+
+    Half of a linear move's change has happened at its midpoint; an ease-out is
+    front-loaded, so it passes half by ~20% of the way through. A reader fitting
+    an easing curve off motion.json depends on this being true of the data.
+    """
+    def half_change_fraction(clip, end):
+        extracted, _ = frames.extract_motion(str(clip), tmp_path / clip.stem, 1.0, end, source_fps=60.0)
+        measured = frames.measure_motion(extracted)
+        total = measured[-1]["cum_delta"]
+        i = next(i for i, f in enumerate(measured) if f["cum_delta"] >= total / 2)
+        return i / (len(measured) - 1)
+
+    assert half_change_fraction(slide_clip, 1.3) == pytest.approx(0.5, abs=0.12)
+    assert half_change_fraction(eased_clip_cubic, 1.5) < 0.3
+
+
+# --- window clipping ----------------------------------------------------------
+
+
+def test_envelope_flags_a_window_that_clips_the_motion(slide_clip: Path, tmp_path):
+    """The docs tell you to use a tight window, and a tight window silently
+    truncated the answer: --start 1.00 --end 1.30 on a move that runs exactly
+    1.000 -> 1.300 reported 183ms with nothing to say it was cut short."""
+    extracted, _ = frames.extract_motion(str(slide_clip), tmp_path, 1.0, 1.3, source_fps=60.0)
+    env = frames.motion_envelope(frames.measure_motion(extracted))
+    assert env["clipped_start"] is True
+    assert env["clipped_end"] is True
+    # The reported span is the whole window, i.e. a lower bound on the real move.
+    assert env["duration_ms"] == pytest.approx(283, abs=20)
+
+
+def test_envelope_does_not_cry_clipped_on_a_generous_window(slide_clip: Path, tmp_path):
+    extracted, _ = frames.extract_motion(str(slide_clip), tmp_path, 0.5, 2.0, source_fps=60.0)
+    env = frames.motion_envelope(frames.measure_motion(extracted))
+    assert env["clipped_start"] is False
+    assert env["clipped_end"] is False
+    assert env["duration_ms"] == pytest.approx(300, abs=20)
+
+
+# --- low-contrast fades -------------------------------------------------------
+# The headline fix. A 400ms card fade-in on white is plainly visible to a person
+# and, at low contrast, completely invisible to a per-frame change threshold:
+# 23 luma levels spread over 24 frames is under one level per frame, so three of
+# those frames register exactly 0.0. Accumulating is the only way to see it.
+
+
+@pytest.mark.parametrize("contrast", [23, 55, 110, 222])
+def test_envelope_recovers_a_low_contrast_fade(lowcontrast_clips, contrast, tmp_path):
+    """Ground truth is 1.000 -> 1.400 at every contrast.
+
+    Contrasts 23 and 55 used to report "no change detected above the noise
+    floor"; 110 reported 334ms. Contrast 222 now over-runs to ~467ms because
+    x264's deblocking ripples around the card edge for a few frames after the
+    fade settles — see MOTION_NOISE_FLOOR for the measured trade that buys.
+    """
+    tolerance = 20 if contrast != 222 else 70
+    extracted, _ = frames.extract_motion(
+        str(lowcontrast_clips[contrast]), tmp_path, 0.0, 2.0, source_fps=60.0
+    )
+    env = frames.motion_envelope(frames.measure_motion(extracted))
+    assert env["first_motion"] == pytest.approx(1.0, abs=0.02)
+    assert env["duration_ms"] == pytest.approx(400, abs=tolerance)
+
+
+def test_the_faintest_fade_is_invisible_frame_to_frame(lowcontrast_clips, tmp_path):
+    """Executable statement of why the metric had to change.
+
+    Not "the old threshold was a bit high" — at contrast 23 the per-frame signal
+    is below one 8-bit quantisation step, so no per-frame floor above zero can
+    ever see this animation. What survives is the accumulation.
+    """
+    extracted, _ = frames.extract_motion(
+        str(lowcontrast_clips[23]), tmp_path, 0.0, 2.0, source_fps=60.0
+    )
+    measured = frames.measure_motion(extracted)
+    during = [f for f in measured if 1.0 < f["timestamp_seconds"] <= 1.4]
+
+    assert max(f["peak_delta"] for f in during) <= 2.0
+    assert min(f["peak_delta"] for f in during) == 0.0, "frames where nothing registers"
+    # The old rule, verbatim, finds nothing at all.
+    assert not [f for f in measured if f["peak_delta"] >= 6.0]
+    # The cumulative curve is unambiguous over the same frames.
+    assert measured[-1]["cum_delta"] >= 20.0
+
+
+def test_a_still_clip_is_not_dragged_over_the_line_by_the_lower_floor(
+    static_clip: Path, lowcontrast_clips, tmp_path
+):
+    """The risk of accumulating: given enough frames, noise adds up to anything.
+
+    Guarded two ways — a genuinely static clip, and the still tail of a fade clip
+    after its animation has finished.
+    """
+    still, _ = frames.extract_motion(str(static_clip), tmp_path / "a", 0.0, 2.0, source_fps=10.0)
+    assert frames.motion_envelope(frames.measure_motion(still))["first_motion"] is None
+
+    tail, _ = frames.extract_motion(
+        str(lowcontrast_clips[23]), tmp_path / "b", 1.5, 2.0, source_fps=60.0
+    )
+    assert frames.motion_envelope(frames.measure_motion(tail))["first_motion"] is None
+
+
+# --- gradual transitions ------------------------------------------------------
+
+
+def test_envelope_measures_a_cross_dissolve(dissolve_clip: Path, tmp_path):
+    """"How long is this cross-dissolve" routes straight here, and the answer
+    used to be "no change detected above the noise floor".
+
+    The dissolve spreads 102 units of luma change over 30 frames, so every step
+    is 2-4 against an absolute floor of 6.0 — it misses by 1.5x on every single
+    frame while repainting half as much of the picture as the hard cut that the
+    same rule catches 34x over.
+    """
+    extracted, _ = frames.extract_motion(
+        str(dissolve_clip), tmp_path, 2.5, 4.5, source_fps=30.0
+    )
+    measured = frames.measure_motion(extracted)
+    env = frames.motion_envelope(measured)
+
+    assert env["first_motion"] == pytest.approx(3.0, abs=0.04)
+    assert env["last_motion"] == pytest.approx(4.0, abs=0.04)
+    assert env["duration_ms"] == pytest.approx(1000, abs=30)
+    # The old rule, verbatim, on the same frames.
+    assert not [f for f in measured if f["peak_delta"] >= 6.0]
+
+
+def test_a_hard_cut_reads_as_one_frame(dissolve_clip: Path, tmp_path):
+    """The other half of the comparison: the same clip's hard cut is a single
+    frame of change, and must not be smeared into a transition with a duration."""
+    extracted, _ = frames.extract_motion(
+        str(dissolve_clip), tmp_path, 1.0, 2.0, source_fps=30.0
+    )
+    env = frames.motion_envelope(frames.measure_motion(extracted))
+    assert env["duration_ms"] == pytest.approx(33, abs=20)
+    assert env["last_motion"] == pytest.approx(1.5, abs=0.04)
+
+
+def test_the_largest_event_wins_when_a_window_holds_two(dissolve_clip: Path, tmp_path):
+    """Documented behaviour, asserted so it cannot drift into a surprise.
+
+    Over the whole clip the envelope describes the hard cut, not the dissolve —
+    the cut moves twice as much luma. That is why the motion workflow says to put
+    --start/--end around one transition rather than around the scene holding it.
+    """
+    extracted, _ = frames.extract_motion(
+        str(dissolve_clip), tmp_path, 0.0, 6.0, source_fps=30.0
+    )
+    env = frames.motion_envelope(frames.measure_motion(extracted))
+    assert env["last_motion"] == pytest.approx(1.5, abs=0.04)
+    assert env["duration_ms"] < 100
+
+
+# --- regressions found by review, not by the suite ----------------------------
+
+
+def test_motion_sampled_coarser_than_the_gap_allowance_still_merges():
+    """A cap-thinned run samples slower than the 120ms merge allowance, and the
+    gap between two *adjacent samples* is not stillness — it is the sampling
+    period. Subtracting it is what makes the rule frame-rate independent.
+
+    Before: ten consecutive moving frames 200ms apart could never merge (200 >
+    120), so every frame became its own event and the report said 200ms for
+    1800ms of continuous motion.
+    """
+    measured = [
+        {"timestamp_seconds": i * 0.2, "peak_delta": 0.0 if i == 0 else 50.0}
+        for i in range(10)
+    ]
+    assert frames.motion_envelope(measured)["duration_ms"] == pytest.approx(1800, abs=1)
+
+
+def test_two_separate_animations_are_still_not_merged():
+    """The other side of that fix: subtracting one sampling period must not turn
+    the allowance into "merge everything"."""
+    measured = [
+        {"timestamp_seconds": i / 60, "peak_delta": 50.0 if 0 < i < 60 else 0.0}
+        for i in range(120)
+    ]
+    for i in range(114, 120):
+        measured[i]["peak_delta"] = 50.0          # a second burst 900ms later
+    env = frames.motion_envelope(measured)
+    assert env["duration_ms"] == pytest.approx(983, abs=20), "should report the first event only"
+
+
+def test_clipped_start_is_false_when_the_window_contains_stillness_first():
+    """clipped_start keys on the first *moving* frame, not on the backed-up start.
+
+    Keying on the start index flagged an event whose first moving frame is index
+    2 — which proves frame 0 -> frame 1 was still, i.e. the window does contain
+    the beginning — and printed a "lower bound" caveat over an exact answer.
+    """
+    measured = [
+        {"timestamp_seconds": 0.0, "peak_delta": 0.0},
+        {"timestamp_seconds": 0.1, "peak_delta": 0.0},
+        {"timestamp_seconds": 0.2, "peak_delta": 90.0},
+        {"timestamp_seconds": 0.3, "peak_delta": 90.0},
+        {"timestamp_seconds": 0.4, "peak_delta": 0.0},
+    ]
+    env = frames.motion_envelope(measured)
+    assert env["clipped_start"] is False
+    assert env["duration_ms"] == pytest.approx(200, abs=1)
+
+
+def test_clipped_start_is_true_when_motion_is_underway_at_the_first_frame():
+    measured = [
+        {"timestamp_seconds": 0.0, "peak_delta": 0.0},
+        {"timestamp_seconds": 0.1, "peak_delta": 90.0},
+        {"timestamp_seconds": 0.2, "peak_delta": 90.0},
+        {"timestamp_seconds": 0.3, "peak_delta": 0.0},
+    ]
+    assert frames.motion_envelope(measured)["clipped_start"] is True
+
+
+def test_motion_signal_survives_a_thinned_frame_sequence(motion_clip: Path, tmp_path):
+    """THE silent killer: _even_sample deletes the frames it did not select, so
+    the surviving JPEGs are frame_0001, frame_0021, frame_0041… and the image2
+    demuxer stops at the first missing index. _thumb_frames then returned [],
+    every delta came back 0.0, and the report said "no change detected" about a
+    3-second pan.
+
+    Reached whenever the fps probe cannot thin up front — an unknown frame rate,
+    or a probe that under-counts — which is exactly the case the cap exists for.
+    """
+    extracted, meta = frames.extract_motion(
+        str(motion_clip), tmp_path, 0.0, 3.0, max_frames=10, source_fps=None,
+    )
+    assert meta["even_sampled"] is True, "fixture must actually exercise the thinning path"
+    thumbs = frames._thumb_frames([Path(f["path"]) for f in extracted])
+    assert len(thumbs) == len(extracted), "thumbnails must survive holes in the numbering"
+
+    measured = frames.measure_motion(extracted)
+    assert max(f["peak_delta"] for f in measured) > 50
+    assert frames.motion_envelope(measured)["duration_ms"] == pytest.approx(2983, abs=100)

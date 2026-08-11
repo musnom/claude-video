@@ -18,25 +18,71 @@ from pathlib import Path
 
 
 MAX_FPS = 2.0
-SCENE_THRESHOLD = 0.20
+# ffmpeg's scene metric is the mean absolute luma difference between consecutive
+# frames, normalized to 0-1 — i.e. a straight area-times-contrast budget, and
+# chroma is not counted. A cut between two unrelated camera shots repaints the
+# whole frame and scores 0.8-1.0; a motion-graphics or infographic cut repaints a
+# tenth of it and scores an order of magnitude lower. Measured on an 8-shot
+# infographic whose cuts swap bars inside a frame that otherwise holds still:
+#
+#     threshold 0.20   0 of 7 cuts found     threshold 0.05   7 of 7
+#     threshold 0.10   0 of 7 cuts found     (every cut scores 0.069-0.071)
+#
+# At 0.20 that clip reported "uniform fallback, too few shots (1)" — the tool
+# telling the model a motion-graphics piece has one shot. Lowering the default is
+# the riskiest change in this file, so it was checked for over-detection against
+# every other fixture: cut / static / motion / slide / vfr return identical
+# candidate counts at 0.20 and 0.05 (13 / 1 / 1 / 1 / 8). 0.03 is where it starts
+# to fire on encoder noise — the vfr clip jumps 8 -> 13 — so 0.05 sits with real
+# margin on both sides rather than at an edge.
+SCENE_THRESHOLD = 0.05
 # Keep scene-detection results once we have at least this many distinct shots.
 # Below this the video is effectively static (screen recording, talking head),
 # so we fall back to uniform sampling. Matching the reference fork's behaviour,
 # this is a low floor — NOT the frame budget — so normal videos with cuts use
 # the (single-pass) scene engine instead of paying for a wasted second decode.
 SCENE_MIN_FRAMES = 8
+# Do not add a frame to split a hole narrower than this. Scene selection can
+# leave most of the cap unspent on a long take, but a clip whose frames are
+# already ~2s apart is covered — padding it to the cap would double the token
+# cost for nothing. Measured effect on the existing fixtures: none, because
+# their gaps are all under 2s.
+GAP_FILL_MIN_SECONDS = 2.0
 # Below this many decoded keyframes a clip is too sparse for keyframe coverage
 # (very short or oddly encoded), so the cheap tier falls back to uniform.
 KEYFRAME_MIN = 4
 MAX_READ_DIMENSION = 1998
 # Frame-delta dedup: downscale each frame to a DEDUP_THUMB x DEDUP_THUMB
-# grayscale thumbnail and treat two frames as near-identical when their mean
-# per-pixel difference (0-255) is at or below DEDUP_THRESHOLD. Conservative on
-# purpose: only collapses frames that are visually the same shot, so a code diff
-# / scrolling terminal / slide-gaining-a-bullet survives. Unlike a within-frame
-# perceptual hash, this distinguishes flat frames (solid slides, fades) by luma.
+# grayscale thumbnail and treat two frames as near-identical only when BOTH the
+# mean per-pixel difference is at or below DEDUP_THRESHOLD and the largest
+# single-cell difference is at or below DEDUP_PEAK_THRESHOLD. Unlike a
+# within-frame perceptual hash, this distinguishes flat frames (solid slides,
+# fades) by luma.
+#
+# The mean alone does not work, and the claim that it did was wrong. A change
+# confined to a few of the 256 cells barely moves a whole-frame average: measured
+# on 1920x1080 slide states each gaining one 620x22 text line, through this
+# module's own 512px pipeline, the means are 1.42 / 1.57 / 1.68 / 1.77 — every one
+# of them under 2.0, so a five-state deck came back as three frames with the
+# builds silently deleted. The same frames' peak cells read 55-70.
+#
+# DEDUP_PEAK_THRESHOLD is calibrated against measurements at both ends:
+#
+#     identical frames, and a static screen recording   0.0
+#     a slowly drifting gradient (no real change)       1-2
+#     heavy synthetic film grain (noise=alls=20)        6-8
+#     ---- threshold 8.0 ----
+#     a real light-mode dropdown panel opening          9.0
+#     a 1080p slide gaining one line of text            55-70
+#     a distinct scene cut                              100+
+#
+# The gap between grain and a real low-contrast UI change is one unit, so this is
+# the tightest constant in the file. It errs toward keeping: on a grainier source
+# than any of the above dedup simply stops collapsing, which costs nothing in
+# tokens (the cap still binds downstream) and loses no information.
 DEDUP_THUMB = 16
 DEDUP_THRESHOLD = 2.0
+DEDUP_PEAK_THRESHOLD = 8.0
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
 
 # --- ffmpeg frame-sync flag compatibility ------------------------------------
@@ -138,6 +184,66 @@ def frame_sync_args() -> tuple[str, ...]:
 # exists so that pointing --motion at a two-hour video fails with a message
 # instead of trying to extract 200,000 JPEGs.
 MOTION_HARD_MAX = 2000
+# Image-token ceiling for an unattended --motion run. MOTION_HARD_MAX bounds the
+# JPEG count but not the cost of reading them: at 512px and 16:9 each frame is
+# 197 image tokens, so hitting that cap is ~394,000 tokens — and by the time the
+# report prints, the frames exist and the model is about to Read every one.
+# 75,000 is about 380 frames, or 6s at 60fps / 12s at 30fps, which is generous
+# for the one-transition window this mode is documented to want. Past it the run
+# is refused rather than warned about, because a warning arrives too late to
+# prevent the spend. An explicit --max-frames overrides: the user has then named
+# the number and can be assumed to mean it.
+MOTION_TOKEN_CEILING = 75_000
+
+# Motion envelope tuning. The old design put a single absolute floor of 6.0 on
+# the *per-frame* change, which is what made a cross-dissolve and a light-mode
+# fade read as "no change detected": their per-frame change is real but small.
+# The floor now sits on the *accumulated* change of one contiguous event, which
+# is the quantity "did something happen" was always asking about. See
+# :func:`motion_envelope` for the measured table these four numbers come from.
+#
+# A frame is moving when its change clears MOTION_NOISE_FLOOR — one unit of an
+# 8-bit thumbnail cell, i.e. the smallest change that is not rounding — or 2% of
+# the loudest frame in the window, whichever is larger. The relative term matters
+# on high-contrast content, where a single-frame encoder transient measured 3-5
+# against real motion of 190.
+#
+# 1.0 rather than something safer, measured across every clip whose duration is
+# known independently (ms, against the truth in the left column):
+#
+#     case              truth   fl=1.0   fl=1.5   fl=2.0   fl=2.5
+#     fade contrast 23    400      400      266      266     none
+#     fade contrast 55    400      400      400      400      383
+#     fade contrast 110   400      400      400      400      400
+#     fade contrast 222   400      467      400      400      400
+#     cubic ease-out      433      433      433      433      433
+#     quintic ease-out    350      350      350      350      350
+#     linear slide        300      300      300      300      300
+#     slide, clipped      283      283      283      283      283
+#     3 s pan            2983     2983     2983     2983     2983
+#     static             none     none     none     none     none
+#     real screen rec      33       33       33       33       33
+#
+# The trade is one row wide and it is not close. At 1.0 the only miss is contrast
+# 222, which over-runs by 67 ms because x264's deblocking ripples around the
+# card's edge for four frames after the fade settles — a case the old absolute
+# floor already handled. At 1.5 the cost is contrast 23, the light-mode case that
+# motivated this whole change, dropping from exact to −33%. Over-reporting a
+# high-contrast animation by four frames is a smaller lie than reporting that a
+# low-contrast one never happened.
+MOTION_NOISE_FLOOR = 1.0
+MOTION_REL_FLOOR = 0.02
+# An event must accumulate this much total change to be called motion. Same 6.0
+# as the old per-frame threshold, deliberately: it is the identical judgement
+# about what counts as real, moved to the quantity that can actually carry it.
+MOTION_MIN_CHANGE = 6.0
+# Stillness shorter than this does not end an event. Whole-pixel quantisation
+# makes the tail of an ease-out stutter — measured on a quintic ease-out, the box
+# moves 1px, holds 150ms, then moves its last pixel — so a strict "first gap ends
+# the animation" rule reported 350ms for a known 500ms move. The allowance grows
+# with the event (half its length so far) so a long animation tolerates a longer
+# stutter while two distinct 100ms animations 200ms apart stay separate.
+MOTION_GAP_MS = 120.0
 
 
 def parse_frame_rate(value: str | None) -> float | None:
@@ -206,6 +312,31 @@ def measure_motion(extracted: list[dict]) -> list[dict]:
     one extra ffmpeg call over the JPEGs already on disk and no new decoding of
     the source.
 
+    Also emits ``cum_delta``: change accumulated from the window's first frame, a
+    monotonically non-decreasing curve that :func:`motion_envelope` reads. The
+    thumbnails only exist inside this function, so this is the one place a
+    cumulative signal costs zero extra decoding.
+
+    **Each step is measured two ways and the larger wins**, because neither alone
+    covers both kinds of animation:
+
+    - *Change from the previous frame* (``peak_delta``) sees movement. It is blind
+      to change slower than one 8-bit step per frame: a 400ms fade whose total
+      contrast is 23 units moves ~0.96 units per frame, which rounds to zero. That
+      is measured, not hypothetical — every per-frame delta through that fade
+      reads 0.0, which is why the old envelope answered "no change detected".
+    - *Growth in the distance from the window's first frame* sees exactly that
+      case, because the rounding accumulates in the comparison rather than in each
+      step: the same fade's distance-from-first climbs cleanly 0 → 29.
+
+    Neither is sufficient. Distance-from-first *saturates* on a moving element:
+    once it clears its own footprint the difference against frame 0 stops growing
+    (two disjoint silhouettes, forever). Measured on the 300ms slide fixture a
+    distance-from-first curve reports 67-133ms, and on a 3s pan 233-267ms, against
+    300ms and 2983ms for the accumulated one. Movement needs path length; slow
+    in-place change needs distance-from-first. Taking the max of the two per-frame
+    contributions gives one curve that is right for both.
+
     Deliberately stops at "how much changed". Velocity, easing classification and
     object tracking are left to the reader of the frames — the script's job is an
     accurate clock and an honest change signal.
@@ -215,45 +346,183 @@ def measure_motion(extracted: list[dict]) -> list[dict]:
     thumbs = _thumb_frames([Path(f["path"]) for f in extracted])
     have_thumbs = len(thumbs) == len(extracted)
     out: list[dict] = []
+    cumulative = 0.0
+    from_first_prev = 0.0
     for i, frame in enumerate(extracted):
         prev_t = extracted[i - 1]["timestamp_seconds"] if i else None
-        mean = peak = 0.0
+        mean = peak = step = 0.0
         if have_thumbs and i:
             mean, peak = _cell_deltas(thumbs[i], thumbs[i - 1])
+            _, from_first = _cell_deltas(thumbs[i], thumbs[0])
+            # The growth term can go negative when an element returns towards its
+            # starting appearance; `peak` is never negative, so max() clamps it.
+            step = max(peak, from_first - from_first_prev)
+            from_first_prev = from_first
+        # Accumulate the unrounded value; rounding each term first would drift by
+        # up to 0.05 per frame, which over a 2000-frame motion run is a bigger
+        # error than the whole signal on a low-contrast fade.
+        cumulative += step
         out.append({
             **frame,
             "gap_ms": None if prev_t is None else round((frame["timestamp_seconds"] - prev_t) * 1000, 1),
             "mean_delta": round(mean, 3),
             "peak_delta": round(peak, 1),
+            # 0.0 on the fail-open path (no thumbnails) rather than absent, so
+            # consumers never have to distinguish "no change" from "no key".
+            "cum_delta": round(cumulative, 1),
         })
     return out
 
 
-def motion_envelope(measured: list[dict], threshold: float = 6.0) -> dict:
-    """When motion starts, when it stops, and where it peaks.
+def _cumulative_curve(measured: list[dict]) -> list[float]:
+    """The monotone change curve for ``measured``, in thumbnail-cell units.
 
-    ``threshold`` is on ``peak_delta`` (0-255). 6.0 sits well above JPEG and
-    encoder noise on a static frame while still catching a small element moving
-    a few pixels.
+    Prefers the ``cum_delta`` :func:`measure_motion` computed, which is the only
+    version that can see change smaller than one 8-bit step per frame. Falls back
+    to accumulating ``peak_delta`` when that key is absent, so this function stays
+    total: callers hand-building a ``measured`` list (and one test that does) get
+    the same shape of answer rather than a KeyError.
     """
-    moving = [i for i, f in enumerate(measured) if f["peak_delta"] >= threshold]
-    if not moving:
-        return {"first_motion": None, "last_motion": None, "duration_ms": None, "peak_at": None}
+    if measured and all("cum_delta" in f for f in measured):
+        return [float(f["cum_delta"] or 0.0) for f in measured]
+    curve: list[float] = []
+    running = 0.0
+    for i, f in enumerate(measured):
+        if i:
+            running += float(f.get("peak_delta") or 0.0)
+        curve.append(running)
+    return curve
+
+
+def motion_envelope(
+    measured: list[dict],
+    noise_floor: float = MOTION_NOISE_FLOOR,
+    min_change: float = MOTION_MIN_CHANGE,
+    gap_ms: float = MOTION_GAP_MS,
+) -> dict:
+    """When the window's largest change event starts, stops, and peaks.
+
+    The old rule flagged every frame whose ``peak_delta`` cleared an absolute 6.0
+    and called the span between the first and last of them the animation. That
+    floor is the single cause of four separate wrong answers, because it asks each
+    frame to be loud on its own:
+
+    ===========================  ==========  =========  ========
+    case                         truth       old        new
+    ===========================  ==========  =========  ========
+    cubic ease-out               500 ms      433 ms*    500 ms
+    quintic ease-out             500 ms      333 ms*    500 ms
+    light-mode fade, contrast 23 400 ms      *none*     400 ms
+    cross-dissolve               1000 ms     *none*     1000 ms
+    300 ms slide, clipped window 300 ms      283 ms     283 ms + flags
+    linear slide                 300 ms      300 ms     300 ms
+    3 s pan                      3000 ms     2983 ms    2983 ms
+    static clip                  none        none       none
+    ===========================  ==========  =========  ========
+
+    \\* the eased rows are the audit's geometry; on this repo's fixtures the old
+    rule happens to land on 500 ms too, because a one-pixel step there measures
+    almost exactly 6.0. That coincidence is the point — the answer depended on how
+    big the moving element was, not on how long it moved.
+
+    The rule now: a frame is *moving* when its change clears a small floor; runs of
+    moving frames are *events*; the event that accumulates the most change is the
+    animation; and it is real only if it accumulates ``min_change`` in total. The
+    6.0 judgement survives, moved from each frame to the event as a whole — which
+    is the quantity that can carry a slow fade.
+
+    Only the largest event is reported, so a window containing a hard cut *and* a
+    dissolve describes the cut. That is why the docs tell you to keep ``--start`` /
+    ``--end`` tight around one transition; ``clipped_start`` / ``clipped_end`` say
+    when the window itself, rather than the motion, decided an endpoint.
+    """
+    empty = {
+        "first_motion": None,
+        "last_motion": None,
+        "duration_ms": None,
+        "peak_at": None,
+        "peak_delta": None,
+        "total_change": 0.0,
+        "event_change": 0.0,
+        "floor": None,
+        # The number the verdict was actually decided against. Reporting `floor`
+        # next to `event_change` compared two quantities that are never compared
+        # with each other, and read literally it said the change had cleared the
+        # bar and been rejected anyway.
+        "min_change": min_change,
+        # Same key set on both branches. The two return shapes used to differ (4
+        # keys vs 6), and that asymmetry leaked straight into motion.json.
+        "clipped_start": False,
+        "clipped_end": False,
+    }
+    if len(measured) < 2:
+        return empty
+
+    curve = _cumulative_curve(measured)
+    times = [float(f["timestamp_seconds"]) for f in measured]
+    steps = [0.0] + [max(0.0, curve[i] - curve[i - 1]) for i in range(1, len(curve))]
+    empty["total_change"] = round(curve[-1], 1)
+    floor = max(noise_floor, max(steps) * MOTION_REL_FLOOR)
+    empty["floor"] = round(floor, 2)
+
+    # The gap between two *adjacent samples* is not stillness — it is just the
+    # sampling period. Subtracting it is what makes the rule work at any frame
+    # rate: without it, a run thinned to one frame per 200ms could never merge
+    # anything (200ms > the 120ms allowance), so 1800ms of continuous motion
+    # reported as 200ms — one frame gap — no matter how long it really ran.
+    periods = sorted(times[i] - times[i - 1] for i in range(1, len(times)))
+    period_ms = periods[len(periods) // 2] * 1000.0
+
+    # [first index, last index, change accumulated] per contiguous event.
+    events: list[list] = []
+    for i in range(1, len(measured)):
+        if steps[i] < floor:
+            continue
+        if events:
+            still_ms = (times[i] - times[events[-1][1]]) * 1000.0 - period_ms
+            span = (times[events[-1][1]] - times[max(0, events[-1][0] - 1)]) * 1000.0
+            if still_ms <= max(gap_ms, 0.5 * span):
+                events[-1][1] = i
+                events[-1][2] += steps[i]
+                continue
+        events.append([i, i, steps[i]])
+
+    if not events:
+        return empty
+    best = max(events, key=lambda e: e[2])
+    if best[2] < min_change:
+        # Report what the loudest candidate actually managed, so "no change
+        # detected" can be checked against a number instead of trusted.
+        empty["event_change"] = round(best[2], 1)
+        return empty
+
     # A delta describes the change between frame i-1 and frame i, so the first
     # frame that *shows* change is one frame after motion actually began. Report
     # the preceding frame as the start, or every measured duration is one frame
     # period short — 283ms for a known 300ms slide at 60fps.
-    start_index = max(0, moving[0] - 1)
-    first = measured[start_index]
-    last = measured[moving[-1]]
-    peak = max(measured, key=lambda f: f["peak_delta"])
+    start_index = max(0, best[0] - 1)
+    end_index = best[1]
+    peak_index = max(range(best[0], end_index + 1), key=lambda i: steps[i])
     return {
-        "first_motion": first["timestamp_seconds"],
-        "last_motion": last["timestamp_seconds"],
-        "duration_ms": round((last["timestamp_seconds"] - first["timestamp_seconds"]) * 1000, 1),
-        "peak_at": peak["timestamp_seconds"],
-        "peak_delta": peak["peak_delta"],
-        "threshold": threshold,
+        "first_motion": measured[start_index]["timestamp_seconds"],
+        "last_motion": measured[end_index]["timestamp_seconds"],
+        "duration_ms": round((times[end_index] - times[start_index]) * 1000, 1),
+        "peak_at": measured[peak_index]["timestamp_seconds"],
+        "peak_delta": round(steps[peak_index], 1),
+        "total_change": round(curve[-1], 1),
+        "event_change": round(best[2], 1),
+        "floor": round(floor, 2),
+        "min_change": min_change,
+        # The window, not the motion, chose this endpoint: the reported duration
+        # is a lower bound. Keyed on the first *moving* index, not on the backed-up
+        # start: a first moving frame at index 1 describes the change from frame 0,
+        # which could have begun before the window opened, but one at index 2
+        # proves frame 0 -> frame 1 was still, so the window does contain the
+        # start and the measurement is exact. Keying on start_index instead
+        # flagged that second case too, printing a "lower bound" caveat over an
+        # exact answer.
+        "clipped_start": best[0] <= 1,
+        "clipped_end": end_index == len(measured) - 1,
     }
 
 
@@ -389,6 +658,41 @@ def extract_motion(
         "cap": cap,
         "crop": crop,
     }
+
+
+def frame_dimensions(
+    width: int | None,
+    height: int | None,
+    resolution: int,
+    crop: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int] | None:
+    """The pixel size of an extracted frame, or None if the source size is unknown.
+
+    Mirrors :func:`_scale_filter` and :func:`_crop_filter` — crop first, then
+    scale down to ``resolution`` wide without upscaling, clamped to
+    MAX_READ_DIMENSION tall. Kept next to them so the two cannot drift: this is
+    what the token estimate is computed from, and an estimate derived from
+    different arithmetic than the extractor uses is worse than none.
+    """
+    if crop is not None:
+        _, _, width, height = crop
+    if not width or not height:
+        return None
+    out_w = min(resolution, width)
+    out_h = min(MAX_READ_DIMENSION, max(1, round(height * out_w / width)))
+    if out_h == MAX_READ_DIMENSION and height * out_w / width > MAX_READ_DIMENSION:
+        out_w = max(1, round(width * MAX_READ_DIMENSION / height))
+    return out_w, out_h
+
+
+def image_tokens(width: int, height: int) -> int:
+    """Anthropic's image-token estimate for one frame: ``(w x h) / 750``.
+
+    A 512px-wide 16:9 frame is 512x288 = 197 tokens. Worth stating in one place
+    because the whole point of the guard below is to put a real number in front
+    of a decision, and the number the docs used to quote was 3-5x too high.
+    """
+    return int(width * height / 750)
 
 
 def _scale_filter(resolution: int) -> str:
@@ -548,6 +852,12 @@ def get_metadata(video_path: str) -> dict:
         "codec": video_stream.get("codec_name"),
         "size_bytes": int(fmt.get("size") or 0),
         "has_audio": audio_stream is not None,
+        # ffmpeg opens a still image through a demuxer named "<codec>_pipe"
+        # (png_pipe, jpeg_pipe, webp_pipe …), which is the one reliable way to
+        # tell "a picture" from "a video whose container forgot to write a
+        # duration". Both report duration 0 and a real width/height, so codec or
+        # duration alone would misclassify one of them.
+        "format_name": fmt.get("format_name"),
     }
 
 
@@ -639,7 +949,14 @@ def extract(
     return [
         {
             "index": i,
-            "timestamp_seconds": round(offset + (i / fps if fps > 0 else 0.0), 2),
+            # 3 decimals like every other engine, but note what this number is:
+            # `i / fps` is where the sampler *asked* for a frame, not where the
+            # returned pixels sit. `-vf fps=N` is a constant-frame-rate resampler
+            # that snaps each output slot to the nearest source frame, so on a
+            # source slower than the sample rate a label can be early by up to
+            # half a sampling period. The finer rounding does not fix that — it
+            # stops the label being quantised to 10ms on top of it.
+            "timestamp_seconds": round(offset + (i / fps if fps > 0 else 0.0), 3),
             "path": str(p),
             "reason": "uniform",
         }
@@ -700,7 +1017,11 @@ def extract_scene_candidates(
         raise SystemExit(f"ffmpeg scene extraction failed: {result.stderr.strip()}")
 
     offset = start_seconds or 0.0
-    timestamps = [round(offset + float(match.group(1)), 2) for match in SHOWINFO_TS_RE.finditer(result.stderr)]
+    # 3 decimals, not 2. These come from ffmpeg's own pts_time, so they are
+    # measured to the millisecond — rounding to a centisecond threw that away and
+    # collided outright above 100fps. Fast cutting lives in the 0.3-1.0s band,
+    # which whole seconds cannot represent at all.
+    timestamps = [round(offset + float(match.group(1)), 3) for match in SHOWINFO_TS_RE.finditer(result.stderr)]
     frames = sorted(out_dir.glob("frame_*.jpg"))
     out: list[dict] = []
     for i, path in enumerate(frames):
@@ -764,20 +1085,30 @@ def extract_at_timestamps(
     start_seconds: float | None = None,
     crop: tuple[int, int, int, int] | None = None,
     end_seconds: float | None = None,
+    reason: str = "transcript-cue",
+    prefix: str = "cue",
 ) -> tuple[list[dict], dict]:
     """Grab exactly one frame at each requested timestamp (transcript cues).
 
     Timestamps are absolute source seconds. Any falling outside an active
-    ``[start, end]`` focus window are dropped. Files use a ``cue_*.jpg`` prefix
-    so they sit alongside detail-engine ``frame_*.jpg`` output without either
-    clobbering the other. When more cues than ``max_frames`` survive, they are
-    even-sampled (first + last kept) before extraction.
+    ``[start, end]`` focus window are dropped. Files use a ``<prefix>_*.jpg``
+    name so they sit alongside detail-engine ``frame_*.jpg`` output without
+    either clobbering the other. When more cues than ``max_frames`` survive, they
+    are even-sampled (first + last kept) before extraction.
+
+    ``reason`` and ``prefix`` exist for :func:`_fill_time_gaps`, which wants the
+    same "one frame at each of these exact times" behaviour under a different
+    label and a different filename. Both have to move together: this function
+    deletes every ``<prefix>_*.jpg`` in ``out_dir`` before it starts, so a second
+    caller sharing the prefix would delete the first caller's frames — and in a
+    /watch run the transcript cues are already on disk by the time the detail
+    engine runs.
     """
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    for existing in out_dir.glob("cue_*.jpg"):
+    for existing in out_dir.glob(f"{prefix}_*.jpg"):
         existing.unlink()
 
     lo = start_seconds or 0.0
@@ -796,7 +1127,7 @@ def extract_at_timestamps(
 
     out: list[dict] = []
     for t in points:
-        path = out_dir / f"cue_{len(out):04d}.jpg"
+        path = out_dir / f"{prefix}_{len(out):04d}.jpg"
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -815,7 +1146,7 @@ def extract_at_timestamps(
                 "index": len(out),
                 "timestamp_seconds": t,
                 "path": str(path),
-                "reason": "transcript-cue",
+                "reason": reason,
             })
 
     meta = {
@@ -875,14 +1206,46 @@ def _thumb_frames(paths: list[Path]) -> list[bytes]:
     if m is None:
         return []
     prefix, digits, ext = m.group(1), m.group(2), m.group(3)
-    pattern = str(paths[0].parent / f"{prefix}%0{len(digits)}d{ext}")
+
+    # A numbered %0Nd pattern only works while the sequence is contiguous: the
+    # image2 demuxer stops at the first index that is missing. _even_sample
+    # deletes the frames it did not select, so after it runs the survivors are
+    # frame_0001, frame_0021, frame_0041… and the demuxer reads exactly one of
+    # them. The byte-count check below then fails and this returns [] — which
+    # fails open for dedup, but for measure_motion means every delta is 0.0 and
+    # the report says "no change detected" about a clip that plainly moves.
+    # Measured on a 3s 60fps pan thinned to 10 frames: 0 thumbnails, max
+    # peak_delta 0.0, envelope None.
+    #
+    # Glob reads whatever is actually on disk, in lexicographic order, which for
+    # zero-padded names is chronological. It is not supported by Windows ffmpeg
+    # builds, so it is used only when the sequence really has holes — the
+    # contiguous case keeps the portable path, and on Windows the holed case
+    # degrades to today's behaviour rather than to something worse.
+    numbers = []
+    for path in paths:
+        match = re.match(r"(.*?)(\d+)(\.[A-Za-z0-9]+)$", path.name)
+        if match is None or match.group(1) != prefix:
+            return []
+        numbers.append(int(match.group(2)))
+    contiguous = numbers == list(range(numbers[0], numbers[0] + len(numbers)))
+
+    if contiguous:
+        source = [
+            "-start_number", str(numbers[0]),
+            "-i", str(paths[0].parent / f"{prefix}%0{len(digits)}d{ext}"),
+        ]
+    else:
+        source = [
+            "-pattern_type", "glob",
+            "-i", str(paths[0].parent / f"{prefix}*{ext}"),
+        ]
 
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
-        "-start_number", str(int(digits)),
-        "-i", pattern,
+        *source,
         "-vf", f"scale={DEDUP_THUMB}:{DEDUP_THUMB},format=gray",
         "-f", "rawvideo",
         "-",
@@ -902,28 +1265,58 @@ def _thumb_frames(paths: list[Path]) -> list[bytes]:
 
 
 def dedupe_perceptual(
-    candidates: list[dict], threshold: float = DEDUP_THRESHOLD
+    candidates: list[dict],
+    threshold: float = DEDUP_THRESHOLD,
+    peak_threshold: float = DEDUP_PEAK_THRESHOLD,
 ) -> tuple[list[dict], int]:
     """Drop near-identical frames from a chronological candidate list.
 
-    Thumbnails the extracted JPEGs and greedily removes frames whose mean
-    per-pixel difference from the last kept one is within ``threshold``. Returns
+    Thumbnails the extracted JPEGs and greedily removes frames that are within
+    *both* ``threshold`` mean per-pixel difference and ``peak_threshold``
+    largest-single-cell difference of the last kept one. Returns
     ``(survivors, dropped_count)``; a no-op (unchanged list) when thumbnails are
     unavailable or there are fewer than two candidates.
     """
     if len(candidates) <= 1:
         return candidates, 0
     thumbs = _thumb_frames([Path(c["path"]) for c in candidates])
-    return _dedupe_by_deltas(candidates, thumbs, threshold)
+    return _dedupe_by_deltas(candidates, thumbs, threshold, peak_threshold)
+
+
+def _is_near_duplicate(
+    thumb: bytes, last: bytes, threshold: float, peak_threshold: float
+) -> bool:
+    """Whether ``thumb`` is close enough to ``last`` to throw away.
+
+    Both tests must agree it is a duplicate. The mean answers "did the picture
+    change" and the peak answers "did anything in it change", and only the second
+    one can see a control changing state on an otherwise identical screen.
+
+    The mismatch case is handled here rather than left to ``_cell_deltas``,
+    because the two helpers fail in opposite directions: ``_frame_delta`` returns
+    ``inf`` on ragged input, which keeps the frame, while ``_cell_deltas`` returns
+    ``(0.0, 0.0)``, which would silently *delete* it. Deleting frames because a
+    decode hiccup made the thumbnails ragged is exactly the failure the fail-open
+    contract exists to prevent.
+    """
+    if not thumb or len(thumb) != len(last):
+        return False
+    mean, peak = _cell_deltas(thumb, last)
+    return mean <= threshold and peak <= peak_threshold
 
 
 def _dedupe_by_deltas(
-    candidates: list[dict], thumbs: list[bytes], threshold: float = DEDUP_THRESHOLD
+    candidates: list[dict],
+    thumbs: list[bytes],
+    threshold: float = DEDUP_THRESHOLD,
+    peak_threshold: float = DEDUP_PEAK_THRESHOLD,
 ) -> tuple[list[dict], int]:
-    """Greedily drop frames within ``threshold`` mean per-pixel difference of the
-    last *kept* frame. Deletes dropped JPEGs and reindexes survivors 0..n-1 (same
-    cleanup contract as :func:`_even_sample`). Fail-open: if ``thumbs`` does not
-    line up 1:1 with ``candidates``, return them unchanged.
+    """Greedily drop frames that are near-duplicates of the last *kept* frame —
+    within ``threshold`` on the mean per-pixel difference *and* within
+    ``peak_threshold`` on the largest single-cell difference. Deletes dropped
+    JPEGs and reindexes survivors 0..n-1 (same cleanup contract as
+    :func:`_even_sample`). Fail-open: if ``thumbs`` does not line up 1:1 with
+    ``candidates``, return them unchanged.
     """
     if len(thumbs) != len(candidates) or len(candidates) <= 1:
         return candidates, 0
@@ -932,7 +1325,7 @@ def _dedupe_by_deltas(
     last = thumbs[0]
     dropped: list[dict] = []
     for cand, thumb in zip(candidates[1:], thumbs[1:]):
-        if _frame_delta(thumb, last) <= threshold:
+        if _is_near_duplicate(thumb, last, threshold, peak_threshold):
             dropped.append(cand)
         else:
             kept.append(cand)
@@ -948,6 +1341,170 @@ def _dedupe_by_deltas(
     return kept, len(dropped)
 
 
+def _percentile(sorted_values: list[float], fraction: float) -> float:
+    """Nearest-rank percentile of an already-sorted list.
+
+    Nearest-rank rather than interpolating: every value here is a real shot
+    length, and reporting an interpolated 0.47s that no shot actually had would
+    be inventing a measurement in a report whose whole problem was inventing
+    measurements.
+    """
+    index = min(len(sorted_values) - 1, max(0, int(round(fraction * (len(sorted_values) - 1)))))
+    return sorted_values[index]
+
+
+def shot_stats(
+    timestamps: list[float],
+    window_start: float = 0.0,
+    window_end: float | None = None,
+) -> dict:
+    """Cut count and shot-length distribution from the full detected-cut list.
+
+    Every cut is timestamped during detection and then most of them are thrown
+    away — ``_even_sample`` keeps ~100 frames *by list index* and unlinks the
+    rest along with their times. Reading the surviving gaps as if they were shot
+    lengths is what made the report 12x wrong: on a clip cutting every 0.5s (840
+    cuts over 600s) the kept frames sit ~6s apart, implying ~10 cuts/min against
+    a true 84. The numbers were already in memory; they were being discarded a
+    line before anyone could use them.
+
+    ``window_end`` is required for both numbers to be true, and leaving it out is
+    its own version of the same bug. Without it:
+
+    - the rate divides by the span between the first and last *cut*, so a clip
+      that cuts eight times in its first four seconds and then holds a card for
+      twenty-six more reports 120 cuts/min against a true 16;
+    - the closing shot — last cut to end of clip — is not a gap between two
+      stamps, so it never enters the distribution at all. On the 12-minute
+      fixture whose final shot runs 250s, ``longest`` came back as 200s.
+
+    Both were caught by review, not by the tests, because every clip the tests
+    measured was uniformly cut and ended on a cut.
+
+    Computed from the candidates *before* dedup, so this is what the detector
+    found. Dedup can then drop a cut between two visually similar shots, which is
+    why the caller reports the dedup count next to these.
+    """
+    stamps = sorted(timestamps)
+    empty = {
+        "cuts": 0, "per_minute": None, "median_s": None, "p10_s": None,
+        "p90_s": None, "shortest_s": None, "longest_s": None, "cut_times": [],
+    }
+    if len(stamps) < 2:
+        return empty
+    boundaries = list(stamps)
+    # The closing shot runs from the last cut to the end of the window. Only
+    # appended when the end is known and actually past the last cut; a caller
+    # that cannot supply it gets the old, short distribution rather than a
+    # fabricated one.
+    if window_end is not None and window_end > stamps[-1]:
+        boundaries.append(window_end)
+    durations = sorted(round(b - a, 3) for a, b in zip(boundaries, boundaries[1:]))
+    # The first candidate is the unconditional first frame, not a cut.
+    cuts = len(stamps) - 1
+    # Rate over the window the detector actually looked at. Not the span between
+    # cuts: that denominator silently excludes the final shot, and the longer
+    # that shot is the more the rate is inflated.
+    span = (window_end - window_start) if window_end is not None else (stamps[-1] - stamps[0])
+    return {
+        "cuts": cuts,
+        "per_minute": round(cuts / (span / 60.0), 1) if span > 0 else None,
+        "median_s": _percentile(durations, 0.5),
+        "p10_s": _percentile(durations, 0.10),
+        "p90_s": _percentile(durations, 0.90),
+        "shortest_s": durations[0],
+        "longest_s": durations[-1],
+        "cut_times": [round(t, 3) for t in stamps[1:]],
+    }
+
+
+def _gap_fill_points(
+    stamps: list[float], end_seconds: float, budget: int, min_gap: float
+) -> list[float]:
+    """Times to add so the biggest holes in ``stamps`` get covered first.
+
+    Repeatedly bisects whichever interval is currently widest, which spreads
+    ``budget`` frames to minimise the worst remaining gap rather than sprinkling
+    them evenly. On the 12-shot / 12-minute fixture that turns a worst gap of
+    250 s into one of ~9 s for the same 100-frame cap.
+
+    The trailing interval — last frame to the end of the clip — is included, and
+    on that fixture it *is* the worst one: the final shot runs 470 s to 720 s and
+    the scene engine represents it with a single frame at 470.
+    """
+    if not stamps or budget <= 0:
+        return []
+    segments = [(a, b) for a, b in zip(stamps, stamps[1:])]
+    if end_seconds > stamps[-1]:
+        segments.append((stamps[-1], end_seconds))
+
+    points: list[float] = []
+    while len(points) < budget:
+        segments.sort(key=lambda s: s[1] - s[0], reverse=True)
+        start, stop = segments[0]
+        if stop - start <= min_gap:
+            break
+        middle = (start + stop) / 2
+        points.append(round(middle, 3))
+        segments[0:1] = [(start, middle), (middle, stop)]
+    return sorted(points)
+
+
+def _fill_time_gaps(
+    video_path: str,
+    out_dir: Path,
+    selected: list[dict],
+    budget: int,
+    resolution: int,
+    crop: tuple[int, int, int, int] | None,
+    start_seconds: float | None,
+    end_seconds: float | None,
+    min_gap: float = GAP_FILL_MIN_SECONDS,
+    window_end: float | None = None,
+) -> tuple[list[dict], int]:
+    """Spend leftover frame budget on the widest holes in the coverage.
+
+    Scene detection returns one frame per shot and stops, so a clip with few
+    shots leaves most of the cap unused — measured on a 12-minute, 12-shot clip:
+    "12 selected from 12 candidates (scene, cap 100)", one frame per 60 s, with a
+    250-second closing shot represented by one frame. The same clip at
+    ``--detail efficient`` returned 50 frames, i.e. the cheap mode beat the
+    default. This spends the remaining 88.
+
+    Runs *after* :func:`_even_sample`, which is not a style choice: that function
+    unlinks every candidate it does not select, so frames added before it would
+    be thinned straight back out. New frames are decoded at the chosen times
+    rather than recovered from the discarded candidates for the same reason —
+    by then those JPEGs are gone.
+    """
+    if budget <= 0 or not selected:
+        return selected, 0
+
+    stamps = [f["timestamp_seconds"] for f in selected]
+    # The caller probes this once and shares it with shot_stats; falling back to
+    # the last frame just means the trailing gap goes unfilled, which is safe.
+    end = window_end if window_end is not None else (end_seconds or stamps[-1])
+    points = _gap_fill_points(stamps, end, budget, min_gap)
+    if not points:
+        return selected, 0
+
+    fills, _meta = extract_at_timestamps(
+        video_path,
+        out_dir,
+        points,
+        resolution=resolution,
+        max_frames=None,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        crop=crop,
+        reason="gap-fill",
+        prefix="fill",
+    )
+    if not fills:
+        return selected, 0
+    return merge_frames(selected, fills), len(fills)
+
+
 def extract_scene_or_uniform(
     video_path: str,
     out_dir: Path,
@@ -959,6 +1516,7 @@ def extract_scene_or_uniform(
     end_seconds: float | None = None,
     crop: tuple[int, int, int, int] | None = None,
     dedup: bool = True,
+    scene_threshold: float = SCENE_THRESHOLD,
 ) -> tuple[list[dict], dict]:
     """Prefer scene selection, falling back to uniform only when the video is
     effectively static (fewer than ``SCENE_MIN_FRAMES`` detected shots).
@@ -980,18 +1538,59 @@ def extract_scene_or_uniform(
         crop=crop,
         start_seconds=start_seconds,
         end_seconds=end_seconds,
+        threshold=scene_threshold,
     )
     scene_count = len(scene_frames)
     if scene_count >= SCENE_MIN_FRAMES:
+        # Probed once and shared: both the shot statistics and the gap-fill need
+        # to know where the window ends, and neither is correct without it.
+        window_start = start_seconds or 0.0
+        window_end = end_seconds
+        if window_end is None:
+            try:
+                window_end = get_metadata(video_path)["duration_seconds"] or None
+            except SystemExit:
+                window_end = None
+        # Read the shot list now: dedup and _even_sample below both delete frames
+        # and their timestamps go with them.
+        shots = shot_stats(
+            [f["timestamp_seconds"] for f in scene_frames], window_start, window_end
+        )
         deduped, n_dropped = dedupe_perceptual(scene_frames) if dedup else (scene_frames, 0)
         cap = len(deduped) if max_frames is None else max_frames
         selected = _even_sample(deduped, cap)
+        # Uncapped detail keeps every detected shot and has no budget to fill
+        # toward, so there is nothing to top up: `max_frames is None` means the
+        # caller asked for the shots, not for a frame count.
+        n_filled = 0
+        if max_frames is not None:
+            selected, n_filled = _fill_time_gaps(
+                video_path,
+                out_dir,
+                selected,
+                budget=max_frames - len(selected),
+                resolution=resolution,
+                crop=crop,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                window_end=window_end,
+            )
         return selected, {
             "engine": "scene",
             "candidate_count": scene_count,
             "deduped_count": n_dropped,
             "selected_count": len(selected),
+            "gap_filled": n_filled,
+            # Independent of which frames survived — that is the point.
+            "shots": shots,
             "fallback": False,
+            # The cap this engine actually enforced, and the duration budget it
+            # actually consumed. Reported rather than recomputed by the caller
+            # because `target_frames`/`fps` reach only the uniform fallback: the
+            # scene path ignores both, so a caller printing them would describe a
+            # code path that did not run.
+            "effective_cap": max_frames,
+            "budget": None,
         }
 
     fallback_cap = target_frames if max_frames is None else min(max_frames, target_frames)
@@ -1005,15 +1604,28 @@ def extract_scene_or_uniform(
         start_seconds=start_seconds,
         end_seconds=end_seconds,
     )
+    # Candidates are what dedup ran against — the uniformly sampled frames, not
+    # the handful of scene cuts that failed the SCENE_MIN_FRAMES test and sent us
+    # here. Reporting `scene_count` made the line self-contradicting ("1 selected
+    # from 1 candidates, 59 near-duplicates dropped"). The shot count that
+    # triggered the fallback is kept separately.
+    sampled_count = len(frames)
     n_dropped = 0
     if dedup:
         frames, n_dropped = dedupe_perceptual(frames)
     return frames, {
         "engine": "uniform",
-        "candidate_count": scene_count,
+        "candidate_count": sampled_count,
+        "scene_count": scene_count,
         "deduped_count": n_dropped,
         "selected_count": len(frames),
         "fallback": True,
+        # Uncapped detail modes still land a real cap here: `fallback_cap` is
+        # `target_frames` when `max_frames is None`, so token-burner's uniform
+        # fallback tops out at the duration budget (<=100) despite the mode
+        # being advertised as uncapped. Report the number that was enforced.
+        "effective_cap": fallback_cap,
+        "budget": target_frames,
     }
 
 
@@ -1089,7 +1701,8 @@ def extract_keyframes(
         )
 
     offset = start_seconds or 0.0
-    timestamps = [round(offset + float(m.group(1)), 2) for m in SHOWINFO_TS_RE.finditer(result.stderr)]
+    # 3 decimals, as in the scene engine: measured pts, so keep the millisecond.
+    timestamps = [round(offset + float(m.group(1)), 3) for m in SHOWINFO_TS_RE.finditer(result.stderr)]
     candidates: list[dict] = []
     for i, path in enumerate(files):
         ts = timestamps[i] if i < len(timestamps) else offset
@@ -1124,15 +1737,23 @@ def extract_keyframes(
             start_seconds=start_seconds,
             end_seconds=end_seconds,
         )
+        # As in the scene fallback: candidates are the uniform samples dedup
+        # actually compared, not the too-few keyframes that triggered this path.
+        sampled_count = len(frames_out)
         n_dropped = 0
         if dedup:
             frames_out, n_dropped = dedupe_perceptual(frames_out)
         return frames_out, {
             "engine": "uniform",
-            "candidate_count": len(candidates),
+            "candidate_count": sampled_count,
+            "keyframe_count": len(candidates),
             "deduped_count": n_dropped,
             "selected_count": len(frames_out),
             "fallback": True,
+            # This fallback computes its own budget from `max_frames` (line
+            # above) — the caller's duration target never reaches it.
+            "effective_cap": budget,
+            "budget": budget,
         }
 
     # Detect-all, drop near-duplicates, then even-sample down to the cap (first +
@@ -1147,6 +1768,8 @@ def extract_keyframes(
         "deduped_count": n_dropped,
         "selected_count": len(selected),
         "fallback": False,
+        "effective_cap": max_frames,
+        "budget": None,
     }
 
 
