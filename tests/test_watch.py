@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -94,3 +95,28 @@ def test_no_dedup_preserves_static_frames(static_clip: Path):
     out = _run(static_clip, "--no-dedup")
     assert "near-duplicate" not in out
     assert _frame_lines(out) > 1
+
+
+def test_cue_frame_labels_have_millisecond_precision(cut_clip: Path):
+    """Dense cue frames must not all collapse onto the same whole-second label.
+
+    Before this, eight cue frames at 50ms spacing printed 00:00 then 00:01 seven
+    times, putting the implied boundary a frame away from the real colour cut.
+    """
+    out = _run(
+        cut_clip, "--detail", "transcript",
+        "--timestamps", "0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85",
+    )
+    stamps = re.findall(r"\(t=([0-9:.]+), reason=transcript-cue\)", out)
+    assert len(stamps) == 8, out
+    assert len(set(stamps)) == 8, f"labels collapsed: {stamps}"
+    assert all("." in s for s in stamps), stamps
+
+
+def test_non_cue_frame_labels_stay_whole_seconds(cut_clip: Path):
+    """No-default-change guard: scene/keyframe/uniform labels are unchanged."""
+    for detail in ("balanced", "efficient"):
+        out = _run(cut_clip, "--detail", detail)
+        stamps = re.findall(r"\(t=([0-9:.]+), reason=", out)
+        assert stamps, out
+        assert not any("." in s for s in stamps), f"{detail}: {stamps}"

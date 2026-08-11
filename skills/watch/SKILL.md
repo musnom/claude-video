@@ -116,7 +116,7 @@ Within a single session, you can skip Step 0 on follow-up `/watch` calls — onc
 ## Recommended limits
 
 - **Best accuracy: videos under 10 minutes.** Frame coverage scales inversely with duration.
-- **Universal rate cap: 2 fps.** The script never samples faster than 2 fps, even when a budget or `--fps` would imply more.
+- **Auto-mode rate cap: 2 fps.** The duration budget never samples faster than 2 fps, and `--fps` cannot raise it. This is a cap on *automatic* sampling — `--timestamps` grabs frames at whatever exact moments you name, with no rate limit.
 - **The frame ceiling is set by the detail mode** (`WATCH_DETAIL` in `~/.config/watch/.env`, or `--detail`), not a single global cap:
   - `transcript` → no frames
   - `efficient` → up to **50** (keyframes)
@@ -147,7 +147,7 @@ Optional flags:
 - `--timestamps T1,T2,…` — grab a frame at each of these absolute timestamps (`SS`, `MM:SS`, or `HH:MM:SS`). This is what Step 3 uses to capture deictic moments the presenter flags ("look here", "as you can see", "notice this") that visual selection alone misses. See "Transcript-cue frames" below for the mechanics.
 - `--max-frames N` — override the preset cap for tighter token budget (e.g. `--max-frames 40`)
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
-- `--fps F` — override auto-fps (clamped to 2 fps max)
+- `--fps F` — nudge the uniform sampler's rate (clamped to 2 fps max). **Narrow in scope:** it only reaches the uniform-sampling fallback, so it does nothing under `--detail efficient` or on any clip the scene engine handles. It is not the way to measure motion or animation timing.
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
 - `--whisper groq|openai|custom` — force a specific Whisper backend (default: a self-hosted endpoint if `WATCH_WHISPER_ENDPOINT` is set, else Groq, else OpenAI)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)

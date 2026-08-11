@@ -176,6 +176,32 @@ def format_time(seconds: float) -> str:
     return f"{minutes:02d}:{sec:02d}"
 
 
+def format_time_ms(seconds: float) -> str:
+    """``MM:SS.mmm`` (``H:MM:SS.mmm`` past an hour) — format_time's clock, one order finer.
+
+    Not a competing formatter: same origin, same field layout, same hour rule, so
+    ``format_time`` is exactly this value rounded to the second. A test pins that.
+
+    Used only where several frames can land inside one second — cue frames and
+    motion frames. Everything else stays whole-second on purpose. ``format_time``
+    is shared with ``transcribe.format_transcript`` so the frame and transcript
+    clocks agree; a caption cue is a ±1s truth and rendering it as ``[00:12.317]``
+    would be precision the source does not have.
+
+    Why this matters: ``format_time`` *rounds*, so at 50ms sampling a frame at
+    t=0.55 prints ``00:01`` while the one at t=0.50 prints ``00:00`` — putting the
+    implied boundary a frame away from where the change actually is. Read off a
+    report like that, a 300ms transition becomes an unanswerable question.
+
+    Milliseconds rather than centiseconds: 120fps content collides at two
+    decimals, and ffmpeg's ``pts_time`` and the ``-ss`` argv are already 3-decimal.
+    """
+    # Integer milliseconds throughout, so .9996 carries into the next second
+    # instead of rendering as ".1000".
+    total_ms = int(round(seconds * 1000))
+    return f"{format_time(total_ms // 1000)}.{total_ms % 1000:03d}"
+
+
 def get_metadata(video_path: str) -> dict:
     if shutil.which("ffprobe") is None:
         raise SystemExit("ffprobe is not installed. Install with: brew install ffmpeg")
@@ -439,7 +465,10 @@ def extract_at_timestamps(
 
     lo = start_seconds or 0.0
     hi = end_seconds if end_seconds is not None else float("inf")
-    requested = sorted(set(round(float(t), 2) for t in timestamps))
+    # 3 decimals: these are precision-targeted frames rendered as MM:SS.mmm,
+    # so rounding the request to 10ms would quantise below one frame period
+    # at 120fps and show up as a label that disagrees with the argv.
+    requested = sorted(set(round(float(t), 3) for t in timestamps))
     in_window = [t for t in requested if lo <= t <= hi]
     dropped = len(requested) - len(in_window)
 

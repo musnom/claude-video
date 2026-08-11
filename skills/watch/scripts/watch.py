@@ -23,9 +23,25 @@ from config import ensure_utf8_console, frame_cap, get_config  # noqa: E402
 # the download and every frame extraction have already succeeded.
 ensure_utf8_console()
 from download import download, fetch_captions, is_url  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
+
+
+# Frame kinds sampled densely enough that several land inside one second. Whole
+# -second labels are actively wrong for these: at 50ms spacing, format_time
+# rounds t=0.55 up to 00:01 while t=0.50 stays 00:00, putting the implied
+# boundary a frame away from the real one. The scene, keyframe and uniform
+# engines keep whole-second labels — they are navigation aids, and changing them
+# would alter every existing report.
+PRECISE_FRAME_REASONS = {"transcript-cue"}
+
+
+def _frame_stamp(frame: dict) -> str:
+    """Render a frame's timestamp at the precision its sampling method warrants."""
+    if frame.get("reason") in PRECISE_FRAME_REASONS:
+        return format_time_ms(frame["timestamp_seconds"])
+    return format_time(frame["timestamp_seconds"])
 
 
 def main() -> int:
@@ -349,13 +365,14 @@ def main() -> int:
         print()
         print(
             "**Read each frame path below with the Read tool to view the image.** "
-            "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source video."
+            "Frames are in chronological order; `t=MM:SS` is the absolute timestamp in the source "
+            "video (`MM:SS.mmm` on precision-targeted frames, where several can share a second)."
         )
         print()
         for frame in frames:
             print(
                 f"- `{frame['path']}` "
-                f"(t={format_time(frame['timestamp_seconds'])}, reason={frame.get('reason', 'selected')})"
+                f"(t={_frame_stamp(frame)}, reason={frame.get('reason', 'selected')})"
             )
     else:
         print("_No frames extracted._")
