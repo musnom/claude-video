@@ -143,8 +143,24 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
     return None, None
 
 
-def extract_audio(video_path: str, out_path: Path) -> Path:
-    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit."""
+def extract_audio(
+    video_path: str,
+    out_path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> Path:
+    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit.
+
+    ``start_seconds`` / ``end_seconds`` clip to the focus window before encoding.
+    A focused run used to upload the whole video's audio regardless: measured on
+    a 10-minute clip with ``--start 5:00 --end 5:20``, 4689 kB went over the wire
+    where the window needed ~156 kB. Everything outside the window was
+    transcribed, paid for, and then discarded by ``filter_range``.
+
+    Returned segments are 0-based against the *clip*, so a caller passing
+    ``start_seconds`` must shift them back into source time —
+    :func:`transcribe_video` does.
+    """
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
 
@@ -154,7 +170,20 @@ def extract_audio(video_path: str, out_path: Path) -> Path:
         "-hide_banner",
         "-loglevel", "error",
         "-y",
-        "-i", str(Path(video_path).resolve()),
+    ]
+    # Before -i: fast seek, which for an audio-only extraction costs nothing in
+    # accuracy that a Whisper timestamp could resolve.
+    if start_seconds:
+        cmd += ["-ss", f"{start_seconds:.3f}"]
+    cmd += ["-i", str(Path(video_path).resolve())]
+    if end_seconds is not None:
+        # -t (a duration), never -to. With -ss placed before -i the input's clock
+        # is rebased to the seek point, so -to 320 on a --start 300 run would cut
+        # at 620s of source rather than at 320s — silently transcribing five
+        # extra minutes of the wrong material.
+        window = max(0.0, end_seconds - (start_seconds or 0.0))
+        cmd += ["-t", f"{window:.3f}"]
+    cmd += [
         "-vn",
         "-acodec", "libmp3lame",
         "-ar", "16000",
@@ -167,6 +196,24 @@ def extract_audio(video_path: str, out_path: Path) -> Path:
         raise SystemExit(f"ffmpeg audio extraction failed: {result.stderr.strip()}")
     if not out_path.exists() or out_path.stat().st_size == 0:
         raise SystemExit("ffmpeg produced no audio — video may have no audio track")
+    # A non-zero size is not proof of audio once a range is in play. A window that
+    # starts past the end of the stream produces a 333-byte mp3 containing headers
+    # and no MPEG frames: the size guard passes, ffprobe cannot find a duration,
+    # and that empty payload gets uploaded to the Whisper API and billed.
+    if start_seconds or end_seconds is not None:
+        try:
+            clipped_seconds = audio_duration(out_path)
+        except SystemExit:
+            # ffprobe refuses the file outright ("Failed to find two consecutive
+            # MPEG audio frames") — same verdict, better message.
+            clipped_seconds = 0.0
+        if clipped_seconds <= 0:
+            raise SystemExit(
+                f"no audio in the requested range "
+                f"({start_seconds or 0:.3f}s-"
+                f"{end_seconds if end_seconds is not None else 'end'}) — "
+                "check --start/--end against the video's duration"
+            )
     return out_path
 
 
@@ -459,10 +506,21 @@ def transcribe_video(
     audio_out: Path,
     backend: str | None = None,
     api_key: str | None = None,
+    *,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
 ) -> tuple[list[dict], str]:
     """Run the full flow: extract audio → upload → parse segments.
 
     Returns (segments, backend_used). Raises SystemExit on any failure.
+
+    With a focus window, only that window is encoded and uploaded, and the
+    returned segments are shifted back into absolute source time. The shift is
+    not cosmetic: ``watch.filter_range`` selects on absolute time, so unshifted
+    segments from a ``--start 5:00`` run would all sit near t=0 and the filter
+    would discard the entire transcript — a silent, total loss.
+
+    Keyword-only, so the existing positional calls keep working.
     """
     if backend is None or api_key is None:
         detected_backend, detected_key = load_api_key()
@@ -480,8 +538,14 @@ def transcribe_video(
             f"Run `python3 {setup_py}` to configure."
         )
 
-    print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
-    audio_path = extract_audio(video_path, audio_out)
+    scope = (
+        f" over {start_seconds or 0:.1f}-{end_seconds:.1f}s" if end_seconds is not None
+        else f" from {start_seconds:.1f}s" if start_seconds else ""
+    )
+    print(f"[watch] extracting audio for Whisper ({backend}){scope}…", file=sys.stderr)
+    audio_path = extract_audio(
+        video_path, audio_out, start_seconds=start_seconds, end_seconds=end_seconds
+    )
     audio_bytes = audio_path.stat().st_size
 
     def transcribe_one(path: Path) -> list[dict]:
@@ -503,6 +567,14 @@ def transcribe_video(
         )
         chunks = split_audio(audio_path, audio_out.parent / "chunks", plan)
         segments = transcribe_chunks(chunks, transcribe_one)
+
+    # One choke point covering both paths above. transcribe_chunks has already
+    # shifted each chunk by its offset *within the clip*; this shifts the clip
+    # itself into source time, and the two compose. Applying it inside either
+    # branch instead would either miss the single-upload path or double-count on
+    # the chunked one.
+    if start_seconds:
+        segments = shift_segments(segments, start_seconds)
 
     if not segments:
         raise SystemExit("Whisper returned no transcript segments")

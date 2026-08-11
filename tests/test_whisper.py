@@ -155,3 +155,166 @@ class TestTranscribeChunks:
 
         with pytest.raises(SystemExit):
             whisper.transcribe_chunks(chunks, always_fail)
+
+
+class TestExtractAudioRange:
+    """A focused run used to upload the whole video's audio.
+
+    Measured on a 10-minute clip with --start 5:00 --end 5:20: 4689 kB over the
+    wire against ~156 kB of actual window. Everything outside the window was
+    transcribed, paid for, and then thrown away by filter_range.
+    """
+
+    def _argv(self, monkeypatch) -> list[list[str]]:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+
+            class _Result:
+                returncode = 0
+                stdout = stderr = ""
+
+            return _Result()
+
+        monkeypatch.setattr(whisper.subprocess, "run", fake_run)
+        monkeypatch.setattr(whisper.Path, "exists", lambda self: True)
+        monkeypatch.setattr(whisper.Path, "stat", lambda self: type("S", (), {"st_size": 1})())
+        # These tests are about argv construction, so the emptiness guard — which
+        # really does shell out to ffprobe — is stubbed rather than exercised. It
+        # has its own test below.
+        monkeypatch.setattr(whisper, "audio_duration", lambda path: 1.0)
+        return calls
+
+    def test_no_range_argv_is_unchanged(self, monkeypatch, tmp_path):
+        calls = self._argv(monkeypatch)
+        whisper.extract_audio("v.mp4", tmp_path / "a.mp3")
+        assert "-ss" not in calls[0] and "-t" not in calls[0]
+
+    def test_start_seeks_before_the_input(self, monkeypatch, tmp_path):
+        """Fast seek. After -i it would decode and discard everything first."""
+        calls = self._argv(monkeypatch)
+        whisper.extract_audio("v.mp4", tmp_path / "a.mp3", start_seconds=300.0)
+        argv = calls[0]
+        assert argv[argv.index("-ss") + 1] == "300.000"
+        assert argv.index("-ss") < argv.index("-i")
+
+    def test_range_uses_a_duration_not_an_absolute_end(self, monkeypatch, tmp_path):
+        """THE trap. With -ss before -i the input clock is rebased to the seek
+        point, so `-to 320` on a --start 300 run would cut at 620s of source —
+        five extra minutes of the wrong material, silently."""
+        calls = self._argv(monkeypatch)
+        whisper.extract_audio("v.mp4", tmp_path / "a.mp3", start_seconds=300.0, end_seconds=320.0)
+        argv = calls[0]
+        assert "-to" not in argv
+        assert argv[argv.index("-t") + 1] == "20.000"
+        assert argv.index("-t") > argv.index("-i")
+
+    def test_end_without_start_is_a_duration_from_zero(self, monkeypatch, tmp_path):
+        calls = self._argv(monkeypatch)
+        whisper.extract_audio("v.mp4", tmp_path / "a.mp3", end_seconds=45.0)
+        argv = calls[0]
+        assert "-ss" not in argv
+        assert argv[argv.index("-t") + 1] == "45.000"
+
+    def test_clipped_audio_is_proportional_to_the_window(self, tmp_path):
+        """End to end through real ffmpeg, since the point is the byte count."""
+        source = tmp_path / "long.mp3"
+        _make_mp3(source, 60.0)
+        whole = whisper.extract_audio(str(source), tmp_path / "whole.mp3")
+        window = whisper.extract_audio(
+            str(source), tmp_path / "window.mp3", start_seconds=20.0, end_seconds=25.0
+        )
+        assert whisper.audio_duration(window) == pytest.approx(5.0, abs=0.5)
+        assert window.stat().st_size < whole.stat().st_size / 5
+
+
+class TestTranscribeVideoRange:
+    """The shift back into source time, which is what keeps filter_range from
+    silently discarding the whole transcript."""
+
+    def _stub(self, monkeypatch, tmp_path, segments, audio_bytes=1024):
+        audio = tmp_path / "audio.mp3"
+        audio.write_bytes(b"x" * audio_bytes)
+        monkeypatch.setattr(
+            whisper, "extract_audio",
+            lambda video, out, start_seconds=None, end_seconds=None: audio,
+        )
+        monkeypatch.setattr(whisper, "_transcribe_file", lambda b, k, p: list(segments))
+        return audio
+
+    def test_segments_come_back_in_absolute_source_time(self, monkeypatch, tmp_path):
+        self._stub(monkeypatch, tmp_path, [{"start": 0.0, "end": 2.0, "text": "hi"}])
+        segments, _ = whisper.transcribe_video(
+            "v.mp4", tmp_path / "audio.mp3", backend="groq", api_key="k",
+            start_seconds=300.0, end_seconds=320.0,
+        )
+        assert segments == [{"start": 300.0, "end": 302.0, "text": "hi"}]
+
+    def test_no_window_means_no_shift(self, monkeypatch, tmp_path):
+        self._stub(monkeypatch, tmp_path, [{"start": 1.0, "end": 2.0, "text": "hi"}])
+        segments, _ = whisper.transcribe_video(
+            "v.mp4", tmp_path / "audio.mp3", backend="groq", api_key="k",
+        )
+        assert segments == [{"start": 1.0, "end": 2.0, "text": "hi"}]
+
+    def test_the_shift_survives_filter_range(self, monkeypatch, tmp_path):
+        """The failure this prevents, stated end to end: clip without shifting
+        and every segment lands near t=0, so filter_range drops all of them and
+        the report says "no transcript" for a video that has one."""
+        import transcribe
+
+        self._stub(monkeypatch, tmp_path, [{"start": 0.0, "end": 2.0, "text": "hi"}])
+        segments, _ = whisper.transcribe_video(
+            "v.mp4", tmp_path / "audio.mp3", backend="groq", api_key="k",
+            start_seconds=300.0, end_seconds=320.0,
+        )
+        assert transcribe.filter_range(segments, 300.0, 320.0) == segments
+        # Unshifted, the same segments vanish.
+        assert transcribe.filter_range([{"start": 0.0, "end": 2.0, "text": "hi"}], 300.0, 320.0) == []
+
+    def test_chunk_offsets_and_the_window_shift_compose(self, monkeypatch, tmp_path):
+        """transcribe_chunks already shifts by each chunk's offset within the
+        clip. The window shift stacks on top; it must not be applied twice."""
+        audio = self._stub(
+            monkeypatch, tmp_path, [{"start": 0.0, "end": 1.0, "text": "x"}],
+            audio_bytes=whisper.MAX_UPLOAD_BYTES + 1,
+        )
+        monkeypatch.setattr(whisper, "audio_duration", lambda p: 100.0)
+        monkeypatch.setattr(
+            whisper, "split_audio",
+            lambda full, work, plan: [(audio, offset) for offset, _dur in plan],
+        )
+        segments, _ = whisper.transcribe_video(
+            "v.mp4", tmp_path / "audio.mp3", backend="groq", api_key="k",
+            start_seconds=600.0,
+        )
+        assert segments[0]["start"] == 600.0
+        assert all(s["start"] >= 600.0 for s in segments)
+        # Two chunks at offsets 0 and 50 within the clip -> 600 and 650 absolute.
+        assert [s["start"] for s in segments] == [600.0, 650.0]
+
+
+def test_a_window_past_the_end_of_the_audio_is_refused(tmp_path):
+    """A non-zero file size is not proof of audio.
+
+    Measured: asking for 10-20s of a 3s clip writes a 333-byte mp3 with
+    headers and no MPEG frames. The size guard passed it, ffprobe cannot find
+    a duration in it, and that empty payload was uploaded to the Whisper API
+    and billed.
+    """
+    source = tmp_path / "short.mp3"
+    _make_mp3(source, 3.0)
+    with pytest.raises(SystemExit, match="no audio in the requested range"):
+        whisper.extract_audio(
+            str(source), tmp_path / "past_end.mp3",
+            start_seconds=10.0, end_seconds=20.0,
+        )
+
+def test_a_window_inside_the_audio_is_accepted(tmp_path):
+    source = tmp_path / "short.mp3"
+    _make_mp3(source, 3.0)
+    out = whisper.extract_audio(
+        str(source), tmp_path / "ok.mp3", start_seconds=1.0, end_seconds=2.0,
+    )
+    assert whisper.audio_duration(out) == pytest.approx(1.0, abs=0.3)
