@@ -1559,16 +1559,20 @@ def extract_scene_or_uniform(
         deduped, n_dropped = dedupe_perceptual(scene_frames) if dedup else (scene_frames, 0)
         cap = len(deduped) if max_frames is None else max_frames
         selected = _even_sample(deduped, cap)
-        # Uncapped detail keeps every detected shot and has no budget to fill
-        # toward, so there is nothing to top up: `max_frames is None` means the
-        # caller asked for the shots, not for a frame count.
+        # Uncapped detail still fills gaps, against the duration budget rather
+        # than a cap. Skipping it there made `token-burner` — the maximum-fidelity
+        # mode the report's own long-video warning recommends — return *fewer*
+        # frames than `balanced`: measured 12 against 100 on a 12-minute clip,
+        # because balanced topped up to its cap and token-burner stopped at the
+        # detected shots. Uncapped means "keep every shot", not "cover less".
+        fill_target = max_frames if max_frames is not None else target_frames
         n_filled = 0
-        if max_frames is not None:
+        if fill_target is not None:
             selected, n_filled = _fill_time_gaps(
                 video_path,
                 out_dir,
                 selected,
-                budget=max_frames - len(selected),
+                budget=fill_target - len(selected),
                 resolution=resolution,
                 crop=crop,
                 start_seconds=start_seconds,

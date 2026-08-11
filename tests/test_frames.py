@@ -441,3 +441,33 @@ def test_real_clip_shot_rate_matches_its_duration(sparse_cuts_clip: Path, tmp_pa
     assert shots["cuts"] == 11
     assert shots["per_minute"] == pytest.approx(0.9, abs=0.1)
     assert shots["longest_s"] == pytest.approx(250.0, abs=1.0)
+
+
+def test_token_burner_covers_at_least_as_much_as_balanced(sparse_cuts_clip: Path, tmp_path: Path):
+    """The maximum-fidelity mode must not return fewer frames than the default.
+
+    Gap-fill was gated on `max_frames is not None`, so token-burner — which the
+    report's own long-video warning recommends for better coverage — stopped at
+    the 12 detected shots while balanced topped up to 100. Uncapped means "keep
+    every shot", not "cover less".
+    """
+    balanced, _ = frames.extract_scene_or_uniform(
+        str(sparse_cuts_clip), tmp_path / "b", fps=0.5, target_frames=100, max_frames=100,
+    )
+    burner, meta = frames.extract_scene_or_uniform(
+        str(sparse_cuts_clip), tmp_path / "t", fps=0.5, target_frames=100, max_frames=None,
+    )
+    assert len(burner) >= len(balanced), f"token-burner {len(burner)} < balanced {len(balanced)}"
+    assert meta["gap_filled"] > 0
+    # Every detected shot still survives — filling is additive.
+    assert sum(1 for f in burner if f["reason"] in ("first-frame", "scene-change")) == 12
+
+
+def test_uncapped_fill_does_not_shrink_a_cut_heavy_clip(cut_clip: Path, tmp_path: Path):
+    """A clip with more detected shots than the duration budget keeps them all
+    and fills nothing — the budget is a floor for coverage, not a ceiling."""
+    out, meta = frames.extract_scene_or_uniform(
+        str(cut_clip), tmp_path / "f", fps=2.0, target_frames=5, max_frames=None,
+    )
+    assert len(out) == meta["candidate_count"] == 13
+    assert meta["gap_filled"] == 0
