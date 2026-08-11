@@ -2,6 +2,34 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.3.0] — 2026-08-10
+
+### Fixed
+- **Frame extraction no longer breaks on ffmpeg 9.** ffmpeg 9.0 removed `-vsync`, which `frames.py` passed at both extraction sites, so `balanced` and `efficient` — the only frame-producing modes — returned nothing at all. Swapping to `-fps_mode` alone would have broken the other end: it does not exist before ffmpeg 5.1, and Ubuntu 22.04 LTS ships 4.4.2 through 2027. The local binary is now probed once per run (~17 ms, memoized) and the spelling it accepts is used. Verified against simulated 4.4 and 9.0 binaries: the old code fails 21 tests on ffmpeg 9, the new code passes on both.
+- **`efficient` detail no longer crashes on a range with no keyframe.** Seeking past the only keyframe on a static clip starves the mjpeg encoder, so ffmpeg failed at encoder init and the uniform fallback twelve lines below was unreachable in exactly the case it existed for — while `balanced` handled the same window fine.
+- **Auto-caption transcripts no longer repeat themselves.** YouTube paints captions into a rolling two-line window, emitting every spoken line three times; the old dedupe caught exact repeats and strict prefixes but not the rolling handoff. Measured on real tracks: 6,662 → 3,368 words, 49,210 → 24,679 on a 2h13m talk, ~1.98x across the board. Hand-authored subtitles are detected and passed through untouched.
+- **Transcript timestamps no longer run late.** Cue bodies were terminated on the first whitespace-only line, but WebVTT ends a cue at a genuinely *empty* line and YouTube pads with a `" "` line before the painted text — so every painted cue was dropped whole and its text attributed to the settle cue after it, up to ~7 s behind the frames.
+- **Transcript and frame timestamps now use one clock.** `format_transcript` built its own stamp, rendering t=3700 as `[61:40]` where the frame at the same instant read `1:01:40`. It now shares `frames.format_time`.
+- **Caption fetches are bounded.** `--sub-langs en.*` is a regex yt-dlp fullmatches against every track: on one real video that meant 33 requests, 22 rate-limit rejections and 13.7 s to pick a file it would have picked from two. Now 2.6 s.
+- **Non-English videos return their own captions**, not YouTube's machine translation of their own ASR, which sat alongside the untouched original.
+- **HTML entities in captions are decoded**, so a hand-authored track no longer ships `R&amp;D` into the model's context.
+- **Windows: the report no longer dies at the last step.** Piped stdout falls back to the ANSI code page, so printing the report's arrow, an em dash, or a CJK/emoji title raised `UnicodeEncodeError` *after* the download and every frame extraction had already succeeded.
+- **Windows: `~/.config/watch/.env` is readable however it was written.** `UnicodeDecodeError` subclasses `ValueError`, so it escaped the `except OSError` guard — a PowerShell `Out-File` or ANSI file crashed the run, and a Notepad UTF-8 BOM parsed into a key that silently never matched, leaving the user permanently told they had no Whisper key. UTF-8, UTF-8-sig, UTF-16 (either endianness, with or without BOM), UTF-32 and legacy code pages all work now.
+- **Windows: child-process output is decoded as UTF-8**, not the locale code page. A CJK filename previously killed `get_metadata` — the first call of every run.
+- **Windows: the SessionStart hook stops nagging.** Windows synthesizes POSIX modes, so the permission check could only ever false-positive and `chmod 600` could not clear it; and the `.env` parser could not read BOM-prefixed files.
+- The three duplicate `.env` parsers are now one. The copy in `whisper.py` never received the inline-comment stripping, so `GROQ_API_KEY=abc  # prod key` went out verbatim as the bearer token and returned a 401 that looked like a bad key.
+
+### Added
+- **Self-hosted / fully local transcription.** Point `WATCH_WHISPER_ENDPOINT` at any OpenAI-compatible `/v1/audio/transcriptions` server — whisper.cpp's `whisper-server`, speaches, LocalAI, vLLM — and audio never leaves the machine. No API key is sent, no dependency is added: the existing stdlib client already spoke the protocol. Optional `WATCH_WHISPER_MODEL`; force with `--whisper custom`; reported honestly as `whisper (custom)`.
+- **The transcript-cue pass is now Step 3 of the default flow** rather than an optional extra. Visual selection misses the moments a speaker points at something, because pointing at a slide is a low-visual-change event.
+- **A test suite that runs.** `requirements-dev.txt` plus a `.venv` workflow, and CI across ubuntu/macOS/Windows — there was no CI before. 71 tests to 187.
+- Tests are isolated from the developer's own `~/.config/watch/.env`; four failed on a clean checkout if `WATCH_DETAIL` was configured.
+
+### Changed
+- Sub-hour transcript stamps round rather than truncate, so `59.7s` reads `[01:00]`. This is what makes them agree with the frame labels.
+- Genuinely repeated speech in hand-authored subtitles is preserved. The old exact-equal-consecutive-cue rule deleted it — a speaker reading numbers aloud ("Four." / "Four."), a restated instruction, a lyric refrain.
+- `*.sh` and `*.py` are pinned to LF. Git for Windows defaults to `core.autocrlf=true`, which checked out the hook script as CRLF and killed it on `set -euo pipefail\r`.
+
 ## [0.2.0] — 2026-06-29
 
 ### Added

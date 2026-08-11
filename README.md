@@ -168,9 +168,27 @@ Captions cover the majority of public videos for free. The Whisper fallback only
 | Capability | What you need | Cost |
 |------------|---------------|------|
 | Download + native captions | `yt-dlp` + `ffmpeg` | Free |
-| Whisper fallback (preferred) | [Groq API key](https://console.groq.com/keys) — `whisper-large-v3` | Cheap, fast |
-| Whisper fallback (alt) | [OpenAI API key](https://platform.openai.com/api-keys) — `whisper-1` | Standard pricing |
+| Whisper fallback, fully local | `WATCH_WHISPER_ENDPOINT` → any OpenAI-compatible server | Free, nothing leaves your machine |
+| Whisper fallback (preferred cloud) | [Groq API key](https://console.groq.com/keys) — `whisper-large-v3` | Cheap, fast |
+| Whisper fallback (alt cloud) | [OpenAI API key](https://platform.openai.com/api-keys) — `whisper-1` | Standard pricing |
 | Disable Whisper entirely | `--no-whisper` | Free, frames-only when no captions |
+
+### Fully local transcription
+
+The Whisper client speaks plain OpenAI-compatible multipart, which is the same
+protocol whisper.cpp's `whisper-server`, speaches, LocalAI and vLLM all expose.
+So there is no package to install and no separate backend — just point it at
+your own server:
+
+```bash
+# in ~/.config/watch/.env
+WATCH_WHISPER_ENDPOINT=http://127.0.0.1:8080/v1/audio/transcriptions
+WATCH_WHISPER_MODEL=whisper-1          # optional
+```
+
+No `Authorization` header is sent, the endpoint takes priority over any cloud
+keys you have configured, and the report labels the run `whisper (custom)` so
+it is obvious where the audio went.
 
 ## Usage
 
@@ -195,7 +213,7 @@ Other knobs (passed to `scripts/watch.py`):
 - `--max-frames N` — lower the frame cap for a tighter token budget.
 - `--resolution W` — bump frame width to 1024 px when Claude needs to read on-screen text (slides, terminals, code).
 - `--fps F` — override the auto-fps calculation (still capped at 2 fps).
-- `--whisper groq|openai` — force a specific Whisper backend.
+- `--whisper groq|openai|custom` — force a specific Whisper backend. Default: a self-hosted endpoint if `WATCH_WHISPER_ENDPOINT` is set, else Groq, else OpenAI.
 - `--no-whisper` — disable transcription entirely; frames only.
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the one before them (held slides, static screen recordings, paused video), so the frame budget is spent on distinct content; this flag turns that off.
 - `--out-dir DIR` — keep working files somewhere specific (default: auto-generated tmp dir).
