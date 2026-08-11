@@ -369,3 +369,78 @@ def test_crop_shrinks_the_frame_rather_than_growing_it(tmp_path):
     cw, ch = dims(cropped[0]["path"])
     assert (cw, ch) == (160, 120)
     assert cw * ch < fw * fh
+
+
+# --- motion measurement -------------------------------------------------------
+# slide_clip animates from t=1.000 to t=1.300 — a known 300ms envelope.
+
+
+def test_measure_motion_annotates_gaps_and_change(slide_clip: Path, tmp_path):
+    extracted, _ = frames.extract_motion(
+        str(slide_clip), tmp_path, 0.0, 2.5, source_fps=60.0
+    )
+    measured = frames.measure_motion(extracted)
+    assert len(measured) == len(extracted)
+    assert measured[0]["gap_ms"] is None
+    assert all(f["gap_ms"] is not None for f in measured[1:])
+    assert all(15 <= f["gap_ms"] <= 18 for f in measured[1:])
+
+
+def test_peak_delta_catches_what_mean_delta_misses(slide_clip: Path, tmp_path):
+    """The reason there are two numbers.
+
+    A 120x60 element on a 640x360 frame occupies a few of 256 thumbnail cells,
+    so its movement is divided away by a whole-frame average. Measured: during
+    the slide the mean peaks at ~2.7 on a 0-255 scale — indistinguishable from
+    noise, and barely above the dedup threshold of 2.0 — while the peak cell
+    reads ~116.
+    """
+    extracted, _ = frames.extract_motion(
+        str(slide_clip), tmp_path, 0.0, 2.5, source_fps=60.0
+    )
+    measured = frames.measure_motion(extracted)
+    during = [f for f in measured if 1.0 <= f["timestamp_seconds"] <= 1.32]
+    assert during
+    assert max(f["mean_delta"] for f in during) < 10, "mean should be nearly blind here"
+    assert max(f["peak_delta"] for f in during) > 50, "peak must see the element move"
+
+
+def test_motion_envelope_recovers_a_known_duration(slide_clip: Path, tmp_path):
+    """Ground truth is 1.000 -> 1.300. Must land within one frame period."""
+    extracted, _ = frames.extract_motion(
+        str(slide_clip), tmp_path, 0.0, 2.5, source_fps=60.0
+    )
+    env = frames.motion_envelope(frames.measure_motion(extracted))
+    assert env["first_motion"] == pytest.approx(1.0, abs=0.02)
+    assert env["last_motion"] == pytest.approx(1.3, abs=0.02)
+    assert env["duration_ms"] == pytest.approx(300, abs=20)
+
+
+def test_motion_envelope_reports_nothing_on_a_static_clip(static_clip: Path, tmp_path):
+    extracted, _ = frames.extract_motion(
+        str(static_clip), tmp_path, 0.0, 2.0, source_fps=10.0
+    )
+    env = frames.motion_envelope(frames.measure_motion(extracted))
+    assert env["first_motion"] is None
+    assert env["duration_ms"] is None
+
+
+def test_envelope_start_is_the_frame_before_the_change():
+    """A delta describes i-1 -> i, so the onset belongs to i-1. Without this
+    every duration comes out one frame period short."""
+    measured = [
+        {"timestamp_seconds": 0.0, "peak_delta": 0.0},
+        {"timestamp_seconds": 0.1, "peak_delta": 0.0},
+        {"timestamp_seconds": 0.2, "peak_delta": 90.0},
+        {"timestamp_seconds": 0.3, "peak_delta": 90.0},
+        {"timestamp_seconds": 0.4, "peak_delta": 0.0},
+    ]
+    env = frames.motion_envelope(measured)
+    assert env["first_motion"] == 0.1
+    assert env["last_motion"] == 0.3
+    assert env["duration_ms"] == pytest.approx(200, abs=1)
+
+
+def test_cell_deltas_handles_mismatched_thumbs():
+    assert frames._cell_deltas(b"", b"") == (0.0, 0.0)
+    assert frames._cell_deltas(b"\x00\x10", b"\x00") == (0.0, 0.0)

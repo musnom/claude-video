@@ -7,6 +7,7 @@ then Reads each frame path to see the video.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -23,7 +24,7 @@ from config import ensure_utf8_console, frame_cap, get_config  # noqa: E402
 # the download and every frame extraction have already succeeded.
 ensure_utf8_console()
 from download import download, fetch_captions, is_url  # noqa: E402
-from frames import MAX_FPS, MOTION_HARD_MAX, parse_crop, validate_crop, auto_fps, auto_fps_focus, extract_at_timestamps, extract_motion, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from frames import MAX_FPS, MOTION_HARD_MAX, measure_motion, motion_envelope, parse_crop, validate_crop, auto_fps, auto_fps_focus, extract_at_timestamps, extract_motion, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -57,6 +58,62 @@ def needs_pixels(cue_timestamps: list, motion: bool) -> bool:
     useless. Both --timestamps and --motion need pixels.
     """
     return bool(cue_timestamps) or bool(motion)
+
+
+def write_motion_data(
+    path: Path,
+    measured: list[dict],
+    envelope: dict,
+    frame_meta: dict,
+    meta: dict,
+    crop: tuple[int, int, int, int] | None,
+) -> Path:
+    """Write the measurements as JSON beside the frames.
+
+    Deliberately stack-agnostic: durations, timestamps, geometry and a change
+    signal, with no CSS, no keyframes, no easing names. The consumer decides
+    whether this becomes a cubic-bezier, a spring config or a GSAP timeline, and
+    that choice depends on the target stack and on what the user asked for —
+    neither of which this script knows or should guess.
+    """
+    cx, cy, cw, ch = crop if crop else (None, None, None, None)
+    payload = {
+        "source": {
+            "width": meta.get("width"),
+            "height": meta.get("height"),
+            "fps": meta.get("fps"),
+            "duration": round(meta.get("duration_seconds") or 0.0, 3),
+        },
+        "crop": None if crop is None else {"x": cx, "y": cy, "w": cw, "h": ch},
+        "window": {
+            "start": frame_meta.get("window", (None, None))[0],
+            "end": frame_meta.get("window", (None, None))[1],
+        },
+        "sampling": {
+            "mode": "every-source-frame" if not frame_meta.get("interval") else "thinned",
+            "interval_ms": round((frame_meta.get("interval") or 0.0) * 1000, 1),
+            "sampled_fps": frame_meta.get("sampled_fps"),
+            "source_fps": frame_meta.get("source_fps"),
+            "min_gap_ms": frame_meta.get("min_gap_ms"),
+            "max_gap_ms": frame_meta.get("max_gap_ms"),
+            "dedup": False,
+            "even_sampled": frame_meta.get("even_sampled", False),
+        },
+        "envelope": envelope,
+        "frames": [
+            {
+                "i": f["index"],
+                "t": f["timestamp_seconds"],
+                "gap_ms": f["gap_ms"],
+                "mean_delta": f["mean_delta"],
+                "peak_delta": f["peak_delta"],
+                "path": f["path"],
+            }
+            for f in measured
+        ],
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
 
 
 def main() -> int:
@@ -240,6 +297,8 @@ def main() -> int:
     frame_meta: dict = {"engine": "none", "candidate_count": 0, "selected_count": 0, "fallback": False}
     cue_frames: list[dict] = []
     cue_meta: dict = {}
+    motion_env: dict = {}
+    motion_data_path: Path | None = None
 
     # Transcript cues are pinned: extracted first and counted against the cap so
     # the detail engine never evicts the moments the user explicitly asked for.
@@ -282,6 +341,11 @@ def main() -> int:
             max_frames=motion_cap,
             source_fps=meta.get("fps"),
             crop=crop,
+        )
+        frames = measure_motion(frames)
+        motion_env = motion_envelope(frames)
+        motion_data_path = write_motion_data(
+            work / "motion.json", frames, motion_env, frame_meta, meta, crop,
         )
     elif detail != "transcript" and video_path and detail_budget != 0:
         cap_label = "unlimited" if detail_budget is None else str(detail_budget)
@@ -408,6 +472,17 @@ def main() -> int:
             f"sampled {sampled if sampled is not None else '?'} fps, {source_note}, "
             f"gaps {lo}-{hi} ms, {coverage}, dedup off, cap {frame_meta.get('cap')})"
         )
+        if motion_env.get("first_motion") is not None:
+            print(
+                f"- **Motion envelope:** first change {format_time_ms(motion_env['first_motion'])}, "
+                f"last {format_time_ms(motion_env['last_motion'])}, "
+                f"**{motion_env['duration_ms']:.0f} ms**, peak at "
+                f"{format_time_ms(motion_env['peak_at'])}"
+            )
+        else:
+            print("- **Motion envelope:** no change detected above the noise floor")
+        if motion_data_path:
+            print(f"- **Motion data:** `{motion_data_path}` (per-frame times and change signal)")
         if frame_meta.get("even_sampled") or frame_meta.get("interval"):
             print()
             print(

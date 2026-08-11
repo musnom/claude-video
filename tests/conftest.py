@@ -200,3 +200,30 @@ def vfr_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("clips") / "motion_vfr.mp4"
     build_vfr_clip(path)
     return path
+
+
+def build_slide_clip(path: Path, fps: int = 60) -> None:
+    """A UI-shaped animation with a known envelope: a 120x60 box slides 400px
+    from t=1.000 to t=1.300 — exactly 300 ms — then holds.
+
+    geq rather than drawbox: drawbox evaluates its position expression once at
+    init in this ffmpeg (no `eval` option), so the box snaps to its end position
+    and the clip is static. Verified the hard way.
+    """
+    xp = r"if(lt(T\,1)\,40\,if(lt(T\,1.3)\,40+400*(T-1)/0.3\,440))"
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", f"color=c=white:s=640x360:r={fps}:d=2.5",
+        "-vf",
+        f"geq=lum='if(gte(X\\,{xp})*lte(X\\,({xp})+120)*gte(Y\\,150)*lte(Y\\,210)\\,60\\,255)'"
+        ":cb=128:cr=128",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        str(path),
+    ])
+
+
+@pytest.fixture(scope="session")
+def slide_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "slide.mp4"
+    build_slide_clip(path)
+    return path

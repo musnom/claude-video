@@ -199,3 +199,44 @@ def test_needs_pixels_false_for_plain_transcript():
     """The audio-only fast path must survive — it is why transcript mode is cheap."""
     import watch
     assert watch.needs_pixels([], motion=False) is False
+
+
+def test_motion_writes_stack_agnostic_data(slide_clip: Path, tmp_path):
+    """motion.json is the machine-readable half: geometry, timing and a change
+    signal, with no CSS, keyframes or easing names baked in."""
+    import json
+
+    out_dir = tmp_path / "w"
+    _run(slide_clip, "--motion", "--out-dir", str(out_dir))
+    data = json.loads((out_dir / "motion.json").read_text())
+
+    assert set(data) == {"source", "crop", "window", "sampling", "envelope", "frames"}
+    assert data["source"]["width"] == 640 and data["source"]["height"] == 360
+    assert data["sampling"]["dedup"] is False
+    assert data["sampling"]["mode"] == "every-source-frame"
+    assert data["envelope"]["duration_ms"] == pytest.approx(300, abs=20)
+
+    first = data["frames"][0]
+    assert set(first) == {"i", "t", "gap_ms", "mean_delta", "peak_delta", "path"}
+    assert first["gap_ms"] is None
+    assert all(f["gap_ms"] is not None for f in data["frames"][1:])
+
+    blob = json.dumps(data).lower()
+    for leak in ("cubic-bezier", "keyframe", "ease-in", "css", "framer"):
+        assert leak not in blob, f"stack-specific output leaked into the data: {leak}"
+
+
+def test_motion_report_states_the_envelope(slide_clip: Path):
+    out = _run(slide_clip, "--motion")
+    assert "Motion envelope:" in out
+    assert "Motion data:" in out
+    assert "ms**" in out
+
+
+def test_motion_json_records_the_crop(slide_clip: Path, tmp_path):
+    import json
+
+    out_dir = tmp_path / "w"
+    _run(slide_clip, "--motion", "--crop", "40,150,500,60", "--out-dir", str(out_dir))
+    data = json.loads((out_dir / "motion.json").read_text())
+    assert data["crop"] == {"x": 40, "y": 150, "w": 500, "h": 60}

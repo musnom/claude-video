@@ -180,6 +180,83 @@ def motion_interval(window_seconds: float, source_fps: float | None, cap: int) -
     return window_seconds / cap
 
 
+def _cell_deltas(a: bytes, b: bytes) -> tuple[float, float]:
+    """``(mean, peak)`` change between two DEDUP_THUMB-square grayscale thumbs.
+
+    Two numbers because they answer different questions and disagree in exactly
+    the case that matters. ``mean`` is whole-frame change — good for scene cuts,
+    nearly blind to a button sliding across a static background, since the moving
+    element occupies one of 256 cells and its contribution is divided by 256.
+    ``peak`` is the largest single-cell change, which is precisely that case.
+
+    This is the same blindness that makes dedup destructive on UI animation, so
+    reporting only the mean would hand back a signal that says "nothing moved"
+    for the motion being measured.
+    """
+    if not a or len(a) != len(b):
+        return 0.0, 0.0
+    diffs = [abs(x - y) for x, y in zip(a, b)]
+    return sum(diffs) / len(diffs), float(max(diffs))
+
+
+def measure_motion(extracted: list[dict]) -> list[dict]:
+    """Annotate frames with the gap and the change since the previous frame.
+
+    Reuses the thumbnails the dedup pass already knows how to make, so this costs
+    one extra ffmpeg call over the JPEGs already on disk and no new decoding of
+    the source.
+
+    Deliberately stops at "how much changed". Velocity, easing classification and
+    object tracking are left to the reader of the frames — the script's job is an
+    accurate clock and an honest change signal.
+    """
+    if not extracted:
+        return []
+    thumbs = _thumb_frames([Path(f["path"]) for f in extracted])
+    have_thumbs = len(thumbs) == len(extracted)
+    out: list[dict] = []
+    for i, frame in enumerate(extracted):
+        prev_t = extracted[i - 1]["timestamp_seconds"] if i else None
+        mean = peak = 0.0
+        if have_thumbs and i:
+            mean, peak = _cell_deltas(thumbs[i], thumbs[i - 1])
+        out.append({
+            **frame,
+            "gap_ms": None if prev_t is None else round((frame["timestamp_seconds"] - prev_t) * 1000, 1),
+            "mean_delta": round(mean, 3),
+            "peak_delta": round(peak, 1),
+        })
+    return out
+
+
+def motion_envelope(measured: list[dict], threshold: float = 6.0) -> dict:
+    """When motion starts, when it stops, and where it peaks.
+
+    ``threshold`` is on ``peak_delta`` (0-255). 6.0 sits well above JPEG and
+    encoder noise on a static frame while still catching a small element moving
+    a few pixels.
+    """
+    moving = [i for i, f in enumerate(measured) if f["peak_delta"] >= threshold]
+    if not moving:
+        return {"first_motion": None, "last_motion": None, "duration_ms": None, "peak_at": None}
+    # A delta describes the change between frame i-1 and frame i, so the first
+    # frame that *shows* change is one frame after motion actually began. Report
+    # the preceding frame as the start, or every measured duration is one frame
+    # period short — 283ms for a known 300ms slide at 60fps.
+    start_index = max(0, moving[0] - 1)
+    first = measured[start_index]
+    last = measured[moving[-1]]
+    peak = max(measured, key=lambda f: f["peak_delta"])
+    return {
+        "first_motion": first["timestamp_seconds"],
+        "last_motion": last["timestamp_seconds"],
+        "duration_ms": round((last["timestamp_seconds"] - first["timestamp_seconds"]) * 1000, 1),
+        "peak_at": peak["timestamp_seconds"],
+        "peak_delta": peak["peak_delta"],
+        "threshold": threshold,
+    }
+
+
 def extract_motion(
     video_path: str,
     out_dir: Path,
