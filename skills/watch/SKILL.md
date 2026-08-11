@@ -112,6 +112,7 @@ Within a single session, you can skip Step 0 on follow-up `/watch` calls — onc
 - User pastes a video URL (YouTube, Vimeo, X, TikTok, Twitch clip, most yt-dlp-supported sites) and asks about it.
 - User points at a local video file (`.mp4`, `.mov`, `.mkv`, `.webm`, etc.) and asks about it.
 - User types `/watch <url-or-path> [question]`.
+- User asks about **motion or timing** — "how fast does this move", "how long is this transition", "what easing is this", "recreate this animation", "match this motion style". Use `--motion`; see the section below.
 
 ## Recommended limits
 
@@ -151,7 +152,67 @@ Optional flags:
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
 - `--whisper groq|openai|custom` — force a specific Whisper backend (default: a self-hosted endpoint if `WATCH_WHISPER_ENDPOINT` is set, else Groq, else OpenAI)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
+- `--motion` — frame-by-frame motion/timing analysis. Samples the source's own frames (no resampling), labels each to the millisecond, never dedups, overrides `--detail`. See "Measuring and recreating motion" below.
+- `--crop x,y,w,h` — crop to a region in **source** pixels before scaling. Makes a small UI component fill the frame so its position is measurable, and costs fewer tokens. Works in every mode.
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
+
+## Measuring and recreating motion (`--motion`)
+
+Reach for this when the question is about **timing or movement** rather than content:
+"how fast does this move", "how long is that transition", "is this animation janky", "what easing is
+this", "recreate this animation", "match this motion style".
+
+`--motion` samples the source's **own** frames — no resampling — and labels each with its measured
+presentation time to the millisecond. It never dedups, and it overrides `--detail`.
+
+```bash
+python3 "${SKILL_DIR}/scripts/watch.py" "<work-dir>/download/video.mp4" \
+  --motion --start 0:12 --end 0:14 --crop 320,180,400,120 --no-whisper
+```
+
+- **Point it at the downloaded file**, not the URL, on a second pass — the work dir is printed at the
+  bottom of the first report.
+- **Keep the window tight.** One transition, not the scene containing it. Every source frame in the
+  window is extracted.
+- **`--crop x,y,w,h` in source pixels is the single biggest accuracy win** for a UI component. A
+  160×120 button cropped out of a 1920×1080 frame arrives at 1:1 instead of ~8% of the width, so its
+  position is actually measurable — and it costs *fewer* tokens, not more.
+- **Do not reach for `--fps`.** It is capped at 2 fps, reaches only the uniform sampler, and its frames
+  go through dedup. It cannot do this.
+
+### What you get back
+
+Frame labels carry milliseconds (`t=00:12.317`), and the report states the envelope — first change,
+last change, duration, peak. Alongside the frames the script writes **`motion.json`** in the work dir:
+source dimensions and frame rate, the crop rect, the window, sampling stats, and a per-frame series of
+`{t, gap_ms, mean_delta, peak_delta}`.
+
+`peak_delta` is the one to trust for a small element on a static background — a whole-frame average
+barely registers a button sliding. Use it to find where motion starts and stops; use the frames
+themselves to see *what* moved and *how far*.
+
+### Turning that into animation code
+
+1. **Read `motion.json`** for the envelope. That is your duration.
+2. **Read the frames** and track the moving element's position across them. Frame timestamps are
+   absolute source time, so position-vs-time comes straight out.
+3. **Fit the easing** from the shape of that curve — even spacing is linear, front-loaded is ease-out,
+   an overshoot-and-settle is a spring. Say which you concluded and why.
+4. **Emit for the user's stack, and only theirs.** Ask or infer whether they want CSS keyframes,
+   Framer Motion, GSAP, Tailwind, or something else — never assume one. `motion.json` is deliberately
+   stack-agnostic so the same measurements serve any of them.
+5. **Always state the measured numbers** (duration in ms, start and end positions in source pixels,
+   the source dimensions) next to the generated code, so the user can check your work rather than
+   trust it.
+
+Convert pixels to layout units using the **source** dimensions from the report, not the frame
+dimensions — the frames are scaled and, when cropped, offset by the crop origin.
+
+### Getting a good recording to measure
+
+If the user is capturing the clip themselves: record at 2×/retina so small movements survive; leave a
+beat of stillness before and after the animation so its start and end are unambiguous; and keep the
+clip short.
 
 ### Focusing on a section (higher frame rate)
 

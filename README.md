@@ -215,6 +215,8 @@ Other knobs (passed to `scripts/watch.py`):
 - `--fps F` — nudge the uniform sampler's rate (still capped at 2 fps). Only affects the uniform-sampling fallback, so it has no effect under `--detail efficient` or on clips the scene engine handles.
 - `--whisper groq|openai|custom` — force a specific Whisper backend. Default: a self-hosted endpoint if `WATCH_WHISPER_ENDPOINT` is set, else Groq, else OpenAI.
 - `--no-whisper` — disable transcription entirely; frames only.
+- `--motion` — frame-by-frame motion analysis for measuring or recreating animation. Samples the source's own frames rather than resampling to a rate, labels each with its measured timestamp to the millisecond, and never dedups. Writes a stack-agnostic `motion.json` alongside the frames. Overrides `--detail`.
+- `--crop x,y,w,h` — crop to a region in source pixels before scaling. A 160x120 component out of a 1920x1080 frame arrives at 1:1 rather than 8% of the width, so its position is measurable — and it costs fewer tokens, not more.
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the one before them (held slides, static screen recordings, paused video), so the frame budget is spent on distinct content; this flag turns that off.
 - `--out-dir DIR` — keep working files somewhere specific (default: auto-generated tmp dir).
 
