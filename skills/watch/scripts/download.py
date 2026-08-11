@@ -16,6 +16,23 @@ from urllib.parse import urlparse
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
 
+# Caption tracks to request, as a single yt-dlp --sub-langs value shared by both
+# call sites (they must stay in step; _pick_subtitle below can only choose from
+# what these fetch).
+#
+# yt-dlp fullmatches each comma-separated entry as a regex against every
+# available track, so the old `en.*` was not "English" — on a real video it
+# matched 33 tracks, fired 33 requests, collected 22 rate-limit rejections and
+# took 13.7s instead of 2.6s, to select a file it would have picked anyway.
+#
+# `.*-orig` is the source-language track. Without it a non-English video
+# resolves to YouTube's machine *translation* of its own ASR while the original
+# sits unfetched — so the model reads a translation of a transcription when the
+# original was free. Exactly one -orig track exists per video, so this stays
+# bounded. The explicit English codes are the fallback for videos that have no
+# -orig track at all.
+SUB_LANGS = ".*-orig,en,en-US,en-GB"
+
 
 def is_url(source: str) -> bool:
     if source.startswith("-"):
@@ -42,14 +59,24 @@ def resolve_local(path: str) -> dict:
 
 
 def _pick_subtitle(out_dir: Path) -> Path | None:
+    """Choose the best downloaded caption track.
+
+    The source-language track wins over English: on a non-English video the
+    English file is a machine translation of the ASR, so preferring it loses
+    fidelity for nothing. On an English video the -orig track *is* the English
+    one, so this ordering costs nothing there.
+    """
     candidates = sorted(out_dir.glob("video*.vtt"))
     if not candidates:
         return None
-    preferred = [
+    original = [c for c in candidates if "-orig." in c.name]
+    if original:
+        return original[0]
+    english = [
         c for c in candidates
-        if any(marker in c.name for marker in (".en.", ".en-US.", ".en-GB.", ".en-orig."))
+        if any(marker in c.name for marker in (".en.", ".en-US.", ".en-GB."))
     ]
-    return preferred[0] if preferred else candidates[0]
+    return english[0] if english else candidates[0]
 
 
 def _pick_video(out_dir: Path) -> Path | None:
@@ -75,7 +102,7 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", "en.*",
+        "--sub-langs", SUB_LANGS,
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
@@ -132,7 +159,7 @@ def download_url(
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", "en.*",
+        "--sub-langs", SUB_LANGS,
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
