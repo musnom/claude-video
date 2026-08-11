@@ -2,6 +2,22 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.4.0] — 2026-08-11
+
+### Added
+- **`--motion`: frame-by-frame motion and animation-timing analysis.** Samples the source's *own* frames rather than resampling to a rate, labels each with its measured presentation time to the millisecond, and never dedups. Built for measuring how fast an animation moves, how long a transition takes, and recreating easing curves. Overrides `--detail`, so it cannot be a silent no-op the way `--fps` is.
+- **`--crop x,y,w,h`** in source pixels, applied before scaling. A 160×120 component out of a 1920×1080 frame arrives at 1:1 rather than ~8% of the width, so its position is measurable — and it costs *fewer* tokens, not more (26 vs 262 on a measured example). Works in every mode.
+- **`motion.json`**, written beside the frames: source dimensions and frame rate, crop rect, window, sampling stats, and a per-frame series of `{t, gap_ms, mean_delta, peak_delta}`. Deliberately stack-agnostic — the same measurements serve CSS keyframes, Framer Motion, GSAP or Tailwind, and which one is the caller's choice.
+- **A measured motion envelope** in the report: first change, last change, duration, peak. Two change signals per frame, because a whole-frame average is nearly blind to the case that matters — a 120×60 element sliding on a 640×360 frame moved the mean by 2.71 on a 0–255 scale while the peak cell read 116.
+- SKILL.md gains a *Measuring and recreating motion* section: the two-pass flow, how to read `motion.json`, how to get from a position/time series to an easing curve, and an explicit rule to emit for the user's stack only.
+
+### Fixed
+- **Densely sampled frames had wrong timestamps, not merely coarse ones.** Every frame label went through `format_time`, which rounds to the second. Eight cue frames at 50 ms spacing on a clip with a colour cut every 100 ms printed `00:00` then `00:01` seven times — putting the implied boundary a frame away from the real cut. Transcript-cue and motion frames now render `MM:SS.mmm`; scene, keyframe and uniform labels are unchanged.
+- Cue timestamps are stored to 3 decimals rather than 2, so a 50 ms request grid survives intact.
+
+### Changed
+- `--fps`, `--no-dedup` and the "universal rate cap" are documented accurately. `--fps` reaches only the uniform-sampling fallback, so it is inert under `--detail efficient` and on any clip the scene engine handles; the 2 fps ceiling applies to automatic sampling, never to `--timestamps`. The docs previously pointed readers at a flag that silently does nothing.
+
 ## [0.3.0] — 2026-08-10
 
 ### Fixed
