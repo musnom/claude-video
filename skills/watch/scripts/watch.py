@@ -23,7 +23,7 @@ from config import ensure_utf8_console, frame_cap, get_config  # noqa: E402
 # the download and every frame extraction have already succeeded.
 ensure_utf8_console()
 from download import download, fetch_captions, is_url  # noqa: E402
-from frames import MAX_FPS, MOTION_HARD_MAX, auto_fps, auto_fps_focus, extract_at_timestamps, extract_motion, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from frames import MAX_FPS, MOTION_HARD_MAX, parse_crop, validate_crop, auto_fps, auto_fps_focus, extract_at_timestamps, extract_motion, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -99,6 +99,14 @@ def main() -> int:
              "WATCH_WHISPER_ENDPOINT is set, else Groq, else OpenAI.",
     )
     ap.add_argument(
+        "--crop",
+        type=str,
+        default=None,
+        help="Crop to a region before scaling, as x,y,w,h in SOURCE pixels. Makes a small "
+             "UI component fill the frame instead of being a few pixels inside it, so its "
+             "position is measurable — and costs fewer tokens, not more.",
+    )
+    ap.add_argument(
         "--motion",
         action="store_true",
         help="Frame-by-frame motion analysis. Samples the source's OWN frames (no fps "
@@ -125,6 +133,7 @@ def main() -> int:
         raise SystemExit("--max-frames must be greater than zero")
     budget_cap = max_frames if max_frames is not None else 100
     cue_timestamps = parse_timestamps(args.timestamps)
+    crop = parse_crop(args.crop)
 
     if args.out_dir:
         work = Path(args.out_dir).expanduser().resolve()
@@ -186,6 +195,7 @@ def main() -> int:
         "has_audio": False,
     }
     full_duration = meta["duration_seconds"]
+    crop = validate_crop(crop, meta.get("width"), meta.get("height"))
 
     start_sec = parse_time(args.start)
     end_sec = parse_time(args.end)
@@ -242,6 +252,7 @@ def main() -> int:
             max_frames=max_frames,
             start_seconds=start_sec,
             end_seconds=end_sec,
+            crop=crop,
         )
         if cue_meta.get("dropped_out_of_window"):
             print(
@@ -270,6 +281,7 @@ def main() -> int:
             resolution=args.resolution,
             max_frames=motion_cap,
             source_fps=meta.get("fps"),
+            crop=crop,
         )
     elif detail != "transcript" and video_path and detail_budget != 0:
         cap_label = "unlimited" if detail_budget is None else str(detail_budget)
@@ -288,6 +300,7 @@ def main() -> int:
                 start_seconds=start_sec,
                 end_seconds=end_sec,
                 dedup=not args.no_dedup,
+                crop=crop,
             )
         else:  # balanced, token-burner
             frames, frame_meta = extract_scene_or_uniform(
@@ -300,6 +313,7 @@ def main() -> int:
                 start_seconds=start_sec,
                 end_seconds=end_sec,
                 dedup=not args.no_dedup,
+                crop=crop,
             )
 
     if cue_frames:
@@ -362,6 +376,14 @@ def main() -> int:
         )
     if meta.get("width") and meta.get("height"):
         print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
+    if crop:
+        cx, cy, cw, ch = crop
+        # Source coordinates are stated so measured pixels can be converted back
+        # to the real layout (and to CSS units) without guessing the scale.
+        print(
+            f"- **Crop:** {cw}x{ch} at ({cx},{cy}) in source pixels — frame coordinates "
+            f"are offset by that origin"
+        )
     range_mode = "focused" if focused else "full"
     if args.motion:
         print(f"- **Detail:** motion (overrides `{detail}`)")

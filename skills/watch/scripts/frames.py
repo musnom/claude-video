@@ -188,6 +188,7 @@ def extract_motion(
     resolution: int = 512,
     max_frames: int = MOTION_HARD_MAX,
     source_fps: float | None = None,
+    crop: tuple[int, int, int, int] | None = None,
 ) -> tuple[list[dict], dict]:
     """Extract the source's own frames across a window, with measured timestamps.
 
@@ -234,7 +235,7 @@ def extract_motion(
     )
     # select BEFORE scale, so frames we discard are never scaled or encoded;
     # showinfo LAST, so it reports only what actually gets written.
-    vf = f"{select},{_scale_filter(resolution)},showinfo"
+    vf = f"{select},{_crop_filter(crop)}{_scale_filter(resolution)},showinfo"
 
     cmd = [
         "ffmpeg",
@@ -309,6 +310,7 @@ def extract_motion(
         "max_gap_ms": max(gaps) if gaps else None,
         "even_sampled": candidate_count > cap,
         "cap": cap,
+        "crop": crop,
     }
 
 
@@ -317,6 +319,56 @@ def _scale_filter(resolution: int) -> str:
         f"scale=w='min({resolution},iw)':h='min({MAX_READ_DIMENSION},ih)':"
         "force_original_aspect_ratio=decrease:force_divisible_by=2"
     )
+
+
+def parse_crop(value: str | None) -> tuple[int, int, int, int] | None:
+    """Parse ``x,y,w,h`` in source pixels into a crop rect.
+
+    Source coordinates, not scaled ones — the user reads them off the video, and
+    the scale factor is an implementation detail they should not have to know.
+    """
+    if not value:
+        return None
+    parts = [p.strip() for p in str(value).split(",")]
+    if len(parts) != 4:
+        raise SystemExit(
+            f"--crop expects x,y,w,h in source pixels (got {value!r})"
+        )
+    try:
+        x, y, w, h = (int(p) for p in parts)
+    except ValueError:
+        raise SystemExit(f"--crop values must be whole pixels (got {value!r})")
+    if w <= 0 or h <= 0:
+        raise SystemExit(f"--crop width and height must be positive (got {w}x{h})")
+    if x < 0 or y < 0:
+        raise SystemExit(f"--crop x and y must be non-negative (got {x},{y})")
+    return x, y, w, h
+
+
+def validate_crop(
+    crop: tuple[int, int, int, int] | None,
+    width: int | None,
+    height: int | None,
+) -> tuple[int, int, int, int] | None:
+    """Check a crop fits inside the source. A clear error beats an ffmpeg trace."""
+    if crop is None or not width or not height:
+        return crop
+    x, y, w, h = crop
+    if x + w > width or y + h > height:
+        raise SystemExit(
+            f"--crop {x},{y},{w},{h} extends past the {width}x{height} source "
+            f"(needs {x + w}x{y + h}). Check the rect against the video's own resolution."
+        )
+    return crop
+
+
+def _crop_filter(crop: tuple[int, int, int, int] | None) -> str:
+    """Crop clause for a filter chain, or empty. Always precedes scale, so the
+    region fills the output frame instead of being a few pixels inside it."""
+    if crop is None:
+        return ""
+    x, y, w, h = crop
+    return f"crop={w}:{h}:{x}:{y},"
 
 
 def _clamp_fps(fps: float, duration_seconds: float, max_frames: int) -> tuple[float, int]:
@@ -469,6 +521,7 @@ def extract(
     resolution: int = 512,
     max_frames: int = 100,
     start_seconds: float | None = None,
+    crop: tuple[int, int, int, int] | None = None,
     end_seconds: float | None = None,
 ) -> list[dict]:
     if shutil.which("ffmpeg") is None:
@@ -494,7 +547,7 @@ def extract(
 
     cmd += [
         "-i", str(Path(video_path).resolve()),
-        "-vf", f"fps={fps},{_scale_filter(resolution)}",
+        "-vf", f"fps={fps},{_crop_filter(crop)}{_scale_filter(resolution)}",
         "-frames:v", str(max_frames),
         "-q:v", "4",
         output_pattern,
@@ -524,6 +577,7 @@ def extract_scene_candidates(
     max_frames: int | None = 100,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
+    crop: tuple[int, int, int, int] | None = None,
     threshold: float = SCENE_THRESHOLD,
 ) -> list[dict]:
     """Extract first frame plus ffmpeg scene-change frames.
@@ -552,7 +606,7 @@ def extract_scene_candidates(
     if end_seconds is not None:
         cmd += ["-to", f"{end_seconds:.3f}"]
 
-    vf = f"select='eq(n\\,0)+gt(scene\\,{threshold})',{_scale_filter(resolution)},showinfo"
+    vf = f"select='eq(n\\,0)+gt(scene\\,{threshold})',{_crop_filter(crop)}{_scale_filter(resolution)},showinfo"
     cmd += [
         "-i", str(Path(video_path).resolve()),
         "-vf", vf,
@@ -631,6 +685,7 @@ def extract_at_timestamps(
     resolution: int = 512,
     max_frames: int | None = None,
     start_seconds: float | None = None,
+    crop: tuple[int, int, int, int] | None = None,
     end_seconds: float | None = None,
 ) -> tuple[list[dict], dict]:
     """Grab exactly one frame at each requested timestamp (transcript cues).
@@ -673,7 +728,7 @@ def extract_at_timestamps(
             "-ss", f"{t:.3f}",
             "-i", str(Path(video_path).resolve()),
             "-frames:v", "1",
-            "-vf", _scale_filter(resolution),
+            "-vf", f"{_crop_filter(crop)}{_scale_filter(resolution)}",
             "-q:v", "4",
             str(path),
         ]
@@ -825,6 +880,7 @@ def extract_scene_or_uniform(
     max_frames: int | None = 100,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
+    crop: tuple[int, int, int, int] | None = None,
     dedup: bool = True,
 ) -> tuple[list[dict], dict]:
     """Prefer scene selection, falling back to uniform only when the video is
@@ -844,6 +900,7 @@ def extract_scene_or_uniform(
         out_dir,
         resolution=resolution,
         max_frames=None,
+        crop=crop,
         start_seconds=start_seconds,
         end_seconds=end_seconds,
     )
@@ -867,6 +924,7 @@ def extract_scene_or_uniform(
         fps=fps,
         resolution=resolution,
         max_frames=fallback_cap,
+        crop=crop,
         start_seconds=start_seconds,
         end_seconds=end_seconds,
     )
@@ -889,6 +947,7 @@ def extract_keyframes(
     max_frames: int | None = 50,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
+    crop: tuple[int, int, int, int] | None = None,
     dedup: bool = True,
 ) -> tuple[list[dict], dict]:
     """Decode only keyframes (I-frames) — the cheap, near-instant tier.
@@ -920,7 +979,7 @@ def extract_keyframes(
     cmd += [
         "-skip_frame", "nokey",
         "-i", str(Path(video_path).resolve()),
-        "-vf", f"{_scale_filter(resolution)},showinfo",
+        "-vf", f"{_crop_filter(crop)}{_scale_filter(resolution)},showinfo",
     ]
     cmd += frame_sync_args()
     cmd += [
@@ -984,6 +1043,7 @@ def extract_keyframes(
             fps=fps,
             resolution=resolution,
             max_frames=budget,
+            crop=crop,
             start_seconds=start_seconds,
             end_seconds=end_seconds,
         )

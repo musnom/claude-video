@@ -7,6 +7,7 @@ exactly what fps resampling does on a screen recording.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -273,3 +274,98 @@ def test_motion_respects_the_window_offset(motion_clip: Path, tmp_path):
 def test_motion_hard_max_is_a_runaway_guard_not_a_budget():
     """Deliberately generous: motion runs are allowed to be expensive."""
     assert frames.MOTION_HARD_MAX >= 1000
+
+
+# --- crop ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("0,0,10,10", (0, 0, 10, 10)),
+        (" 80 , 60 , 160 , 120 ", (80, 60, 160, 120)),
+        (None, None),
+        ("", None),
+    ],
+)
+def test_parse_crop(value, expected):
+    assert frames.parse_crop(value) == expected
+
+
+@pytest.mark.parametrize("bad", ["1,2,3", "a,b,c,d", "0,0,0,10", "0,0,10,-1", "-1,0,10,10"])
+def test_parse_crop_rejects_bad_input(bad):
+    with pytest.raises(SystemExit):
+        frames.parse_crop(bad)
+
+
+def test_validate_crop_rejects_out_of_bounds():
+    with pytest.raises(SystemExit, match="extends past"):
+        frames.validate_crop((600, 400, 200, 200), 640, 480)
+
+
+def test_validate_crop_accepts_exact_fit():
+    assert frames.validate_crop((0, 0, 640, 480), 640, 480) == (0, 0, 640, 480)
+
+
+def test_validate_crop_passes_through_unknown_dimensions():
+    """No metadata is not a reason to refuse; ffmpeg will complain if it is wrong."""
+    assert frames.validate_crop((0, 0, 10, 10), None, None) == (0, 0, 10, 10)
+
+
+def test_crop_precedes_scale_in_the_chain(monkeypatch, tmp_path):
+    """Crop must come first, or the region is scaled down before being isolated."""
+    calls = _capture_argv(monkeypatch)
+    with pytest.raises(SystemExit):
+        frames.extract_motion("v.mp4", tmp_path, 0.0, 1.0, crop=(8, 4, 32, 16))
+    vf = _vf(calls[0])
+    assert "crop=32:16:8:4" in vf
+    assert vf.index("crop=") < vf.index("scale=")
+
+
+def test_crop_isolates_the_region(tmp_path):
+    """A distinctly-coloured box, cropped to exactly its bounds, fills the frame."""
+    clip = tmp_path / "box.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=navy:s=640x480:r=30:d=1",
+        "-vf", "drawbox=x=80:y=60:w=160:h=120:color=orange@1:t=fill",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip),
+    ], check=True, capture_output=True)
+
+    extracted, info = frames.extract_motion(
+        str(clip), tmp_path / "out", 0.0, 0.2, crop=(80, 60, 160, 120), source_fps=30.0
+    )
+    assert info["crop"] == (80, 60, 160, 120)
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "quiet", "-i", extracted[0]["path"], "-vf", "scale=1:1",
+         "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+        capture_output=True,
+    ).stdout
+    r, g, b = raw[0], raw[1], raw[2]
+    assert r > 200 and 120 < g < 210 and b < 60, f"expected orange, got {(r, g, b)}"
+
+
+def test_crop_shrinks_the_frame_rather_than_growing_it(tmp_path):
+    """The token win: a small region arrives at 1:1 instead of scaled into a
+    full-size frame, so it is both more legible and cheaper."""
+    clip = tmp_path / "box.mp4"
+    subprocess.run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", "color=c=navy:s=640x480:r=30:d=1",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip),
+    ], check=True, capture_output=True)
+
+    def dims(path):
+        out = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_entries", "stream=width,height",
+             "-of", "csv=p=0", str(path)], capture_output=True, text=True).stdout.strip()
+        return tuple(int(v) for v in out.split(",")[:2])
+
+    full, _ = frames.extract_motion(str(clip), tmp_path / "a", 0.0, 0.1, source_fps=30.0)
+    cropped, _ = frames.extract_motion(
+        str(clip), tmp_path / "b", 0.0, 0.1, crop=(80, 60, 160, 120), source_fps=30.0
+    )
+    fw, fh = dims(full[0]["path"])
+    cw, ch = dims(cropped[0]["path"])
+    assert (cw, ch) == (160, 120)
+    assert cw * ch < fw * fh
