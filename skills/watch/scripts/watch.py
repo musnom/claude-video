@@ -23,7 +23,7 @@ from config import ensure_utf8_console, frame_cap, get_config  # noqa: E402
 # the download and every frame extraction have already succeeded.
 ensure_utf8_console()
 from download import download, fetch_captions, is_url  # noqa: E402
-from frames import MAX_FPS, auto_fps, auto_fps_focus, extract_at_timestamps, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from frames import MAX_FPS, MOTION_HARD_MAX, auto_fps, auto_fps_focus, extract_at_timestamps, extract_motion, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -34,7 +34,7 @@ from whisper import load_api_key, transcribe_video  # noqa: E402
 # boundary a frame away from the real one. The scene, keyframe and uniform
 # engines keep whole-second labels — they are navigation aids, and changing them
 # would alter every existing report.
-PRECISE_FRAME_REASONS = {"transcript-cue"}
+PRECISE_FRAME_REASONS = {"transcript-cue", "motion"}
 
 
 def _frame_stamp(frame: dict) -> str:
@@ -42,6 +42,21 @@ def _frame_stamp(frame: dict) -> str:
     if frame.get("reason") in PRECISE_FRAME_REASONS:
         return format_time_ms(frame["timestamp_seconds"])
     return format_time(frame["timestamp_seconds"])
+
+
+def needs_pixels(cue_timestamps: list, motion: bool) -> bool:
+    """Whether this run must download real video rather than audio-only.
+
+    Extracted from main() because it is the sharpest edge in the whole frame
+    pipeline and is otherwise only reachable with a captioned URL, which the
+    test suite deliberately cannot use (no network).
+
+    Transcript detail skips the video download when captions already cover the
+    request. Any mode that grabs actual frames has to override that, or it
+    silently produces nothing — the same class of failure that makes --fps
+    useless. Both --timestamps and --motion need pixels.
+    """
+    return bool(cue_timestamps) or bool(motion)
 
 
 def main() -> int:
@@ -82,6 +97,14 @@ def main() -> int:
         default=None,
         help="Force a specific Whisper backend. Default: a self-hosted endpoint if "
              "WATCH_WHISPER_ENDPOINT is set, else Groq, else OpenAI.",
+    )
+    ap.add_argument(
+        "--motion",
+        action="store_true",
+        help="Frame-by-frame motion analysis. Samples the source's OWN frames (no fps "
+             "resampling), labels each with its measured timestamp to the millisecond, and "
+             "never dedups. For measuring how fast an animation moves, how long a transition "
+             "takes, or recreating easing. Overrides --detail; wants a short --start/--end.",
     )
     ap.add_argument(
         "--no-dedup",
@@ -129,10 +152,14 @@ def main() -> int:
                 print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
                 transcript_segments = []
 
-    # --timestamps needs the video for frame grabs, so it overrides the
-    # transcript-mode download skip (and forces a full, not audio-only, fetch).
-    audio_only = detail == "transcript" and not cue_timestamps
-    if detail == "transcript" and transcript_segments and not cue_timestamps:
+    # --timestamps and --motion both need the video for frame grabs, so either
+    # overrides the transcript-mode download skip (and forces a full, not
+    # audio-only, fetch). Without --motion in both conditions, a user with
+    # WATCH_DETAIL=transcript gets an audio-only download and zero frames — the
+    # exact silent no-op that makes --fps useless.
+    wants_pixels = needs_pixels(cue_timestamps, args.motion)
+    audio_only = detail == "transcript" and not wants_pixels
+    if detail == "transcript" and transcript_segments and not wants_pixels:
         video_path = None
     else:
         if url_source:
@@ -180,6 +207,14 @@ def main() -> int:
     else:
         fps, target = auto_fps(effective_duration, max_frames=budget_cap)
     if args.fps is not None:
+        if args.motion:
+            # Loud, because a silent no-op is the disease this mode cures.
+            print(
+                "[watch] --fps is ignored with --motion: motion samples the source's own "
+                "frames rather than resampling to a rate. Narrow --start/--end to control "
+                "the frame count instead.",
+                file=sys.stderr,
+            )
         fps = min(args.fps, MAX_FPS)
         target = max(1, int(round(fps * effective_duration)))
 
@@ -216,7 +251,27 @@ def main() -> int:
             )
 
     detail_budget = max_frames if max_frames is None else max(0, max_frames - len(cue_frames))
-    if detail != "transcript" and video_path and detail_budget != 0:
+
+    # Motion mode replaces the detail engines entirely. Dispatched BEFORE the
+    # `detail != "transcript"` guard below so it can never become a silent no-op
+    # under a detail mode — the failure that makes --fps useless today.
+    if args.motion and video_path:
+        motion_cap = args.max_frames if args.max_frames is not None else MOTION_HARD_MAX
+        print(
+            f"[watch] motion: sampling source frames over {scope} "
+            f"(source ~{meta.get('fps') or 0:.1f} fps, cap {min(motion_cap, MOTION_HARD_MAX)})…",
+            file=sys.stderr,
+        )
+        frames, frame_meta = extract_motion(
+            video_path,
+            work / "frames",
+            start_seconds=effective_start,
+            end_seconds=effective_end,
+            resolution=args.resolution,
+            max_frames=motion_cap,
+            source_fps=meta.get("fps"),
+        )
+    elif detail != "transcript" and video_path and detail_budget != 0:
         cap_label = "unlimited" if detail_budget is None else str(detail_budget)
         engine_label = "keyframes" if detail == "efficient" else "scene-aware frames"
         print(
@@ -308,9 +363,41 @@ def main() -> int:
     if meta.get("width") and meta.get("height"):
         print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
     range_mode = "focused" if focused else "full"
-    print(f"- **Detail:** {detail}")
+    if args.motion:
+        print(f"- **Detail:** motion (overrides `{detail}`)")
+    else:
+        print(f"- **Detail:** {detail}")
     detail_count = frame_meta.get("selected_count", 0)
-    if detail != "transcript":
+    if args.motion:
+        src = frame_meta.get("source_fps")
+        sampled = frame_meta.get("sampled_fps")
+        lo, hi = frame_meta.get("min_gap_ms"), frame_meta.get("max_gap_ms")
+        source_note = f"source ~{src:.1f} fps" if src else "source rate unknown"
+        coverage = (
+            "every source frame" if not frame_meta.get("interval")
+            else f"thinned to 1 frame per {frame_meta['interval'] * 1000:.0f} ms"
+        )
+        print(
+            f"- **Motion window:** {format_time_ms(effective_start)} → "
+            f"{format_time_ms(effective_end)} ({effective_duration:.3f}s)"
+        )
+        print(
+            f"- **Frames:** {detail_count} (motion, "
+            f"sampled {sampled if sampled is not None else '?'} fps, {source_note}, "
+            f"gaps {lo}-{hi} ms, {coverage}, dedup off, cap {frame_meta.get('cap')})"
+        )
+        if frame_meta.get("even_sampled") or frame_meta.get("interval"):
+            print()
+            print(
+                f"> **Warning:** the window exceeded the {frame_meta.get('cap')}-frame cap, so "
+                f"motion sampled {sampled} fps against a source of ~{src:.1f} fps. Timestamps are "
+                f"still measured, but motion faster than {hi} ms is not resolved. Narrow "
+                "`--start`/`--end` to capture every frame."
+                if src else
+                f"> **Warning:** the window exceeded the {frame_meta.get('cap')}-frame cap and was "
+                "thinned. Narrow `--start`/`--end` to capture every frame."
+            )
+    elif detail != "transcript":
         cap_label = "unlimited" if detail_budget is None else str(detail_budget)
         engine = frame_meta.get("engine", "scene")
         fallback = " with uniform fallback" if frame_meta.get("fallback") else ""

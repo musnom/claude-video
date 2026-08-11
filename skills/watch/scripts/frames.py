@@ -132,6 +132,186 @@ def frame_sync_args() -> tuple[str, ...]:
     return ()
 
 
+# --- motion mode -------------------------------------------------------------
+# Runaway guard only, NOT a token budget. Motion runs are deliberately allowed to
+# be expensive — the whole point is to see every frame of a short window. This
+# exists so that pointing --motion at a two-hour video fails with a message
+# instead of trying to extract 200,000 JPEGs.
+MOTION_HARD_MAX = 2000
+
+
+def parse_frame_rate(value: str | None) -> float | None:
+    """Parse ffprobe's rational frame rate. ``"30000/1001"`` -> 29.97.
+
+    Returns None for the several ways ffprobe says "I don't know": ``"0/0"``,
+    an empty string, or a missing key.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        if "/" in text:
+            num, _, den = text.partition("/")
+            denominator = float(den)
+            if denominator == 0:
+                return None
+            rate = float(num) / denominator
+        else:
+            rate = float(text)
+    except ValueError:
+        return None
+    return rate if rate > 0 else None
+
+
+def motion_interval(window_seconds: float, source_fps: float | None, cap: int) -> float:
+    """Minimum seconds between kept frames; ``0.0`` means keep every source frame.
+
+    Probing first matters on bursty sources. A screen recording that holds a
+    frame for 300ms has far fewer real frames than its wall-clock duration
+    suggests, so computing ``window/cap`` unconditionally would decimate a clip
+    that was never near the cap.
+    """
+    if window_seconds <= 0 or cap <= 0:
+        return 0.0
+    if source_fps is None or source_fps <= 0:
+        return 0.0
+    if source_fps * window_seconds <= cap:
+        return 0.0
+    return window_seconds / cap
+
+
+def extract_motion(
+    video_path: str,
+    out_dir: Path,
+    start_seconds: float,
+    end_seconds: float,
+    resolution: int = 512,
+    max_frames: int = MOTION_HARD_MAX,
+    source_fps: float | None = None,
+) -> tuple[list[dict], dict]:
+    """Extract the source's own frames across a window, with measured timestamps.
+
+    Built for measuring motion — how long a transition takes, what its easing
+    curve looks like — which needs two things the other engines cannot give.
+
+    **No resampling.** The other dense path (``extract``) uses ``-vf fps=N``, a
+    constant-frame-rate resampler: for each output slot it duplicates or drops a
+    source frame and labels the copy with the *slot* time rather than the time of
+    the pixels. On a screen recording that holds a frame between changes, that is
+    catastrophic. Measured on a 48-frame clip with 317ms holds:
+
+        -vf fps=60, label = i/fps     174 JPEGs, 126 duplicates, 304ms max error
+        -vf fps=avg_frame_rate         48 JPEGs,  30 duplicates, 279ms max error
+        select + measured pts          48 JPEGs,   0 duplicates,  ~0ms error
+
+    Note the middle row: matching the resample rate to the source's average rate
+    does not fix it, because an average is meaningless on a bursty source. The
+    fix is to not resample at all.
+
+    **No dedup.** There is deliberately no ``dedup`` parameter, so a caller
+    cannot re-enable it by accident. ``dedupe_perceptual`` compares 16x16
+    grayscale thumbnails against the last *kept* frame, which makes it a
+    motion-dependent resampler: it emits a frame only once enough pixels have
+    changed. On a moving-bar clip it collapsed 180 frames to 15, and the
+    survivors landed 350/267/200/200/183ms apart — it deletes precisely the slow
+    ends of an ease curve, which is the shape being measured.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for existing in out_dir.glob("frame_*.jpg"):
+        existing.unlink()
+
+    window = max(0.0, end_seconds - start_seconds)
+    cap = max(1, min(max_frames, MOTION_HARD_MAX))
+    interval = motion_interval(window, source_fps, cap)
+
+    # ffmpeg's documented "one frame every N seconds" idiom. interval=0 passes
+    # every source frame, so native capture and decimation share one code path.
+    select = (
+        rf"select='isnan(prev_selected_t)+gte(t-prev_selected_t\,{interval:.6f})'"
+    )
+    # select BEFORE scale, so frames we discard are never scaled or encoded;
+    # showinfo LAST, so it reports only what actually gets written.
+    vf = f"{select},{_scale_filter(resolution)},showinfo"
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "info",          # showinfo writes at info level
+        "-y",
+        "-ss", f"{start_seconds:.3f}",
+        "-to", f"{end_seconds:.3f}",
+        "-i", str(Path(video_path).resolve()),
+        "-vf", vf,
+    ]
+    # Load-bearing, not an optimization. Without it the image2 muxer expands the
+    # selection back to constant frame rate and the JPEG list desyncs from the
+    # showinfo list: measured 188 JPEGs against 48 stamps on the same clip.
+    cmd += frame_sync_args()
+    # Deliberately no -frames:v. That flag stops ffmpeg after N frames, which
+    # truncates the tail of the window rather than thinning across it.
+    cmd += ["-q:v", "4", str(out_dir / "frame_%04d.jpg")]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    files = sorted(out_dir.glob("frame_*.jpg"))
+    if result.returncode != 0 and not files:
+        raise SystemExit(f"ffmpeg motion extraction failed: {result.stderr.strip()}")
+    if not files:
+        raise SystemExit(
+            f"motion extraction produced no frames for "
+            f"{format_time_ms(start_seconds)}-{format_time_ms(end_seconds)}"
+        )
+
+    timestamps = [round(float(m.group(1)), 6) for m in SHOWINFO_TS_RE.finditer(result.stderr)]
+    if len(timestamps) != len(files):
+        # Never paper over this with the `timestamps[i] if i < len(...)` idiom the
+        # other engines use — a mislabeled motion frame is a wrong measurement
+        # presented as a right one.
+        raise SystemExit(
+            f"motion extraction desynced: {len(files)} frames written but "
+            f"{len(timestamps)} timestamps reported. This usually means ffmpeg "
+            f"rejected the frame-sync flag {frame_sync_args() or '(none available)'} "
+            "and re-expanded the selection to constant frame rate."
+        )
+
+    offset = start_seconds or 0.0
+    candidates = [
+        {
+            "index": i,
+            "timestamp_seconds": round(offset + ts, 3),
+            "path": str(path),
+            "reason": "motion",
+        }
+        for i, (path, ts) in enumerate(zip(files, timestamps))
+    ]
+
+    candidate_count = len(candidates)
+    # Net for a bad probe (an unknown or wrong source_fps). Even-samples across
+    # the window rather than dropping the tail.
+    selected = _even_sample(candidates, cap) if candidate_count > cap else candidates
+
+    stamps = [f["timestamp_seconds"] for f in selected]
+    gaps = [round((b - a) * 1000) for a, b in zip(stamps, stamps[1:])]
+    span = (stamps[-1] - stamps[0]) if len(stamps) > 1 else 0.0
+    return selected, {
+        "engine": "motion",
+        "candidate_count": candidate_count,
+        "selected_count": len(selected),
+        "deduped_count": 0,
+        "fallback": False,
+        "window": (round(start_seconds, 3), round(end_seconds, 3)),
+        "interval": interval,
+        "source_fps": source_fps,
+        "sampled_fps": round((len(stamps) - 1) / span, 2) if span > 0 else None,
+        "min_gap_ms": min(gaps) if gaps else None,
+        "max_gap_ms": max(gaps) if gaps else None,
+        "even_sampled": candidate_count > cap,
+        "cap": cap,
+    }
+
+
 def _scale_filter(resolution: int) -> str:
     return (
         f"scale=w='min({resolution},iw)':h='min({MAX_READ_DIMENSION},ih)':"
@@ -229,6 +409,11 @@ def get_metadata(video_path: str) -> dict:
     duration = float(fmt.get("duration") or video_stream.get("duration") or 0)
     return {
         "duration_seconds": duration,
+        # Used by motion mode to decide whether the window fits under the cap at
+        # native rate. Never used as a resample rate — see extract_motion.
+        "fps": parse_frame_rate(
+            video_stream.get("avg_frame_rate") or video_stream.get("r_frame_rate")
+        ),
         "width": video_stream.get("width"),
         "height": video_stream.get("height"),
         "codec": video_stream.get("codec_name"),

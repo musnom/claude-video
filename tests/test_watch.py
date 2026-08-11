@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 WATCH = Path(__file__).resolve().parent.parent / "skills" / "watch" / "scripts" / "watch.py"
 
 
@@ -120,3 +122,80 @@ def test_non_cue_frame_labels_stay_whole_seconds(cut_clip: Path):
         stamps = re.findall(r"\(t=([0-9:.]+), reason=", out)
         assert stamps, out
         assert not any("." in s for s in stamps), f"{detail}: {stamps}"
+
+
+# --- motion mode --------------------------------------------------------------
+
+
+@pytest.mark.parametrize("detail", ["transcript", "efficient", "balanced", "token-burner"])
+def test_motion_overrides_every_detail_mode(motion_clip: Path, detail):
+    """--motion must never be a silent no-op.
+
+    This is the failure that makes --fps useless: it reaches only the uniform
+    fallback, so it does nothing under efficient or on scene-rich clips. The
+    transcript case is the sharp one — that mode skips the video download
+    entirely, so without the fix it yields zero frames.
+    """
+    out = _run(motion_clip, "--motion", "--detail", detail)
+    assert "reason=motion" in out, f"{detail}: {out[:400]}"
+    assert _frame_lines(out) > 50, detail
+
+
+def test_motion_overrides_the_configured_default(motion_clip: Path):
+    """Same trap, reached through WATCH_DETAIL rather than the flag."""
+    out = _run(motion_clip, "--motion", env_extra={"WATCH_DETAIL": "transcript"})
+    assert "reason=motion" in out
+    assert _frame_lines(out) > 50
+
+
+def test_motion_labels_carry_milliseconds(motion_clip: Path):
+    out = _run(motion_clip, "--motion", "--start", "1", "--end", "1.5")
+    stamps = re.findall(r"\(t=([0-9:.]+), reason=motion\)", out)
+    assert len(stamps) > 20, out[:400]
+    assert all("." in s for s in stamps), stamps[:5]
+    assert len(set(stamps)) == len(stamps), "labels collapsed inside a second"
+
+
+def test_motion_report_states_dedup_off_and_measured_rate(motion_clip: Path):
+    out = _run(motion_clip, "--motion", "--start", "1", "--end", "1.5")
+    assert "dedup off" in out
+    assert "sampled" in out and "source ~" in out
+    assert "Motion window:" in out
+
+
+def test_motion_warns_when_thinned(motion_clip: Path):
+    out = _run(motion_clip, "--motion", "--max-frames", "10")
+    assert "Warning" in out and "cap" in out
+
+
+def test_motion_ignores_fps_and_says_so(motion_clip: Path):
+    proc = subprocess.run(
+        [sys.executable, str(WATCH), str(motion_clip), "--no-whisper", "--motion",
+         "--fps", "30", "--start", "1", "--end", "1.2"],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "--fps is ignored with --motion" in proc.stderr
+
+
+# --- the download-skip trap ---------------------------------------------------
+# transcript detail skips the video download when captions cover the request.
+# Any mode that grabs frames must override that or it silently yields nothing.
+# Only reachable end-to-end with a captioned URL, which this suite cannot use,
+# so the condition is asserted directly.
+
+
+def test_needs_pixels_for_motion():
+    import watch
+    assert watch.needs_pixels([], motion=True) is True
+
+
+def test_needs_pixels_for_cue_timestamps():
+    import watch
+    assert watch.needs_pixels([1.0, 2.0], motion=False) is True
+
+
+def test_needs_pixels_false_for_plain_transcript():
+    """The audio-only fast path must survive — it is why transcript mode is cheap."""
+    import watch
+    assert watch.needs_pixels([], motion=False) is False
