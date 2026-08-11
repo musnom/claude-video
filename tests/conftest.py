@@ -1239,3 +1239,27 @@ def fast_cut_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("clips") / "fast_cuts.mp4"
     build_cut_clip(path, n=24, seg=0.5)
     return path
+
+
+@pytest.fixture(scope="session")
+def headerless_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A clip whose container declares no duration.
+
+    Piped matroska writes `duration=N/A`, which is what OBS and browser
+    recordings routinely produce. Everything downstream then divides by a zero
+    duration: auto_fps targets a single frame for the whole video and the report
+    says "Duration: 00:00". Built by piping so the header really is absent rather
+    than stripped afterwards.
+    """
+    path = tmp_path_factory.mktemp("clips") / "headerless.mkv"
+    source = path.parent / "source.mp4"
+    build_cut_clip(source)
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-i", str(source), "-c", "copy", "-f", "matroska", "-"],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed building headerless clip:\n{result.stderr[:400]}")
+    path.write_bytes(result.stdout)
+    return path

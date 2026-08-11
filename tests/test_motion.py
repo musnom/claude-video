@@ -189,23 +189,73 @@ def test_motion_labels_match_pixels_vfr(vfr_clip: Path, tmp_path):
     assert max(errors) < 10, f"max label error {max(errors):.1f} ms"
 
 
-def test_fps_resampling_is_much_worse_on_vfr(vfr_clip: Path, tmp_path):
-    """An executable statement of why this engine exists.
+def test_uniform_sampling_labels_match_the_pixels_on_vfr(vfr_clip: Path, tmp_path):
+    """The uniform path used to be the cautionary tale; now it is accurate.
 
-    The old uniform path resamples to a rate and models timestamps as i/fps.
-    On a held-frame source that mislabels by hundreds of milliseconds — larger
-    than the UI transitions being measured.
+    It selects the source's own frames at an interval instead of resampling to a
+    rate, so showinfo reports each frame's real presentation time. This test
+    previously asserted the opposite — that `extract` mislabelled by >100ms on a
+    held-frame source — because it did: measured 304ms of error against 3.3ms now.
     """
     meta = frames.get_metadata(str(vfr_clip))
-    old = frames.extract(
-        str(vfr_clip), tmp_path / "old", fps=meta["fps"], max_frames=200,
+    sampled = frames.extract(
+        str(vfr_clip), tmp_path / "uniform", fps=meta["fps"], max_frames=200,
         start_seconds=0.0, end_seconds=3.0,
     )
-    errors = _label_errors_ms(old)
+    errors = _label_errors_ms(sampled)
+    assert errors
+    assert max(errors) < 20, f"max label error {max(errors):.1f} ms"
+
+
+def test_the_fps_resampler_is_still_the_wrong_tool(vfr_clip: Path, tmp_path):
+    """Why `extract` selects rather than resampling, kept executable.
+
+    `-vf fps=N` is a constant-frame-rate resampler: for each output slot it
+    duplicates or drops a source frame and stamps the copy with the *slot* time.
+    On a source that holds frames between changes that is catastrophic, and the
+    error is unrecoverable afterwards because the real time was discarded. Run
+    directly here so the reason for the select idiom cannot quietly stop being
+    true.
+    """
+    out = tmp_path / "resampled"
+    out.mkdir()
+    meta = frames.get_metadata(str(vfr_clip))
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-to", "3.0", "-i", str(vfr_clip),
+         "-vf", f"fps={meta['fps']},scale=512:-2", "-q:v", "4",
+         str(out / "frame_%04d.jpg")],
+        check=True, capture_output=True,
+    )
+    written = sorted(out.glob("frame_*.jpg"))
+    # The resampler's own model of time: frame i is at i/fps.
+    resampled = [
+        {"path": str(p), "timestamp_seconds": i / meta["fps"]}
+        for i, p in enumerate(written)
+    ]
+    errors = _label_errors_ms(resampled)
     assert max(errors) > 100, (
         f"expected the resampler to mislabel badly, got {max(errors):.1f} ms — "
-        "if this now passes, re-check whether measured PTS is still needed"
+        "if this now passes, re-check whether the select idiom is still needed"
     )
+
+
+def test_motion_mode_keeps_what_uniform_sampling_thins(vfr_clip: Path, tmp_path):
+    """Both engines now report measured times, so the distinction is coverage.
+
+    Motion mode keeps every source frame in the window; uniform sampling thins to
+    an interval. That is the remaining reason to reach for --motion, and it is
+    what makes it able to resolve a transition.
+    """
+    meta = frames.get_metadata(str(vfr_clip))
+    everything, _ = frames.extract_motion(
+        str(vfr_clip), tmp_path / "motion", 0.0, 3.0, source_fps=meta["fps"]
+    )
+    thinned = frames.extract(
+        str(vfr_clip), tmp_path / "uniform", fps=2.0, max_frames=200,
+        start_seconds=0.0, end_seconds=3.0,
+    )
+    assert len(everything) > 3 * len(thinned)
 
 
 def test_motion_keeps_every_source_frame_under_cap(vfr_clip: Path, tmp_path):

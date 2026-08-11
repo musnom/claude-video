@@ -581,3 +581,58 @@ def test_audio_only_report_does_not_advise_reading_frames_that_do_not_exist(tmp_
     assert "no video stream" in out
     assert "proceed with frames only" not in out
     assert "nothing to report" in out
+
+
+# --- --fps honesty --------------------------------------------------------------
+# Two different code paths call themselves "uniform" and only one honours the
+# caller's rate, so the warning cannot be keyed on the engine name.
+
+
+@pytest.mark.parametrize(
+    "detail,clip_name,should_warn,why",
+    [
+        ("balanced", "cut_clip", True, "scene engine selects by content"),
+        ("efficient", "cut_clip", True, "keyframe engine selects by content"),
+        ("efficient", "static_clip", True, "keyframe->uniform derives its own rate"),
+        ("balanced", "static_clip", False, "scene->uniform samples at the caller's rate"),
+    ],
+)
+def test_fps_says_so_exactly_when_it_did_nothing(detail, clip_name, should_warn, why, request):
+    clip = request.getfixturevalue(clip_name)
+    proc = subprocess.run(
+        [sys.executable, str(WATCH), str(clip), "--no-whisper",
+         "--detail", detail, "--fps", "1"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    warned = "had no effect" in proc.stderr
+    assert warned is should_warn, f"{why}: warned={warned}\n{proc.stderr[-400:]}"
+
+
+def test_fps_really_does_bind_on_the_scene_uniform_fallback(static_clip: Path):
+    """The one path where the flag works — asserted so the warning above cannot
+    be "fixed" by making it fire everywhere."""
+    sparse = _run(static_clip, "--no-dedup", "--fps", "0.5")
+    dense = _run(static_clip, "--no-dedup", "--fps", "2")
+    assert _frame_lines(sparse) < _frame_lines(dense)
+
+
+def test_report_states_the_source_frame_rate(motion_clip: Path):
+    """24p / 30p / 60p is a first-order style attribute and it cannot be
+    recovered from the frames — they arrive as stills with no spacing. It used to
+    appear only under --motion."""
+    out = _run(motion_clip, "--detail", "transcript")
+    assert re.search(r"\*\*Resolution:\*\* 320x240 @ 60 fps \(", out), out
+
+
+def test_frame_rate_is_omitted_rather_than_faked_when_unknown(monkeypatch, cut_clip: Path):
+    """parse_frame_rate returns None for ffprobe's several ways of saying "I
+    don't know" (0/0, empty, missing). The line must drop the figure, not print
+    a zero."""
+    import sys as _sys
+    _sys.path.insert(0, str(WATCH.parent))
+    import frames as frames_mod
+
+    assert frames_mod.parse_frame_rate("0/0") is None
+    out = _run(cut_clip, "--detail", "transcript")
+    assert "@ 0 fps" not in out

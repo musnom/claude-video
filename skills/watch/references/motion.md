@@ -52,22 +52,25 @@ motion`. If that total is close to the threshold, the animation is probably real
 noise floor of the recording — re-record at higher contrast, or `--crop` tighter so the moving
 element fills more of the frame. If it is zero, nothing moved.
 
-## Turning that into animation code
+## Reading the measurements
 
-1. **Read `motion.json`** for the envelope. That is your duration.
-2. **Read the frames** and track the moving element's position across them. Frame timestamps
-   are absolute source time, so position-vs-time comes straight out.
-3. **Fit the easing** from the shape of that curve — even spacing is linear, front-loaded is
-   ease-out, an overshoot-and-settle is a spring. Say which you concluded and why.
-4. **Emit for the user's stack, and only theirs.** Ask or infer whether they want CSS
-   keyframes, Framer Motion, GSAP, Tailwind, or something else — never assume one.
-   `motion.json` is deliberately stack-agnostic so the same measurements serve any of them.
-5. **Always state the measured numbers** (duration in ms, start and end positions in source
-   pixels, the source dimensions) next to the generated code, so the user can check your work
-   rather than trust it.
+Three things come out of a motion run, and they are all you need:
+
+- **Duration** — the envelope, from `motion.json` or the report.
+- **Position over time** — track the moving element across the frames. Their timestamps are
+  absolute source time, so this falls straight out.
+- **Shape** — from the spacing of those positions. Even spacing is linear, front-loaded is an
+  ease-out, overshoot-and-settle is a spring.
 
 Convert pixels to layout units using the **source** dimensions from the report, not the frame
 dimensions — the frames are scaled and, when cropped, offset by the crop origin.
+
+If the user wants this as code, write it the way you would write any other code, for their
+stack and no one else's. Two things are worth carrying over from the measurement into whatever
+you produce: **state the numbers you measured** next to it, so they can check your work rather
+than trust it, and say which easing you concluded and why. `motion.json` is deliberately
+stack-agnostic — durations, positions and a change signal, no CSS, no keyframes, no easing
+names — so it serves any target equally.
 
 ### An ease-out's measured duration is shorter than its authored duration
 

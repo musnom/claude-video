@@ -42,14 +42,13 @@ from whisper import load_api_key, transcribe_video  # noqa: E402
 # placed wrong: at 50ms spacing t=0.55 printed 00:01 while t=0.50 printed 00:00,
 # putting the implied boundary a frame away from the real cut.
 #
-# Precision is honest for these because the timestamps are measured — scene and
-# keyframe frames carry ffmpeg's own pts_time, cue and gap-fill frames were
-# requested at an exact instant. `uniform` is the exception and is included
-# anyway: its timestamp is nominal (`i / fps`, where the sampler asked rather
-# than where the pixels are), so it can be early by up to half a sampling
-# period. Printing it at one precision and everything else at another would
-# imply the difference is about the clock rather than about the sampler; the
-# report says which engine ran, and the Frames line says what that means.
+# Precision is honest for all of them because every timestamp is measured.
+# Scene, keyframe and uniform frames carry ffmpeg's own pts_time; cue and
+# gap-fill frames were requested at an exact instant and the decoder returns the
+# nearest frame at or after it. `uniform` used to be the exception — it carried
+# `i / fps`, where the sampler asked rather than where the pixels were, early by
+# up to half a sampling period — until extract() stopped resampling and started
+# selecting source frames.
 PRECISE_FRAME_REASONS = {
     "transcript-cue", "motion", "scene-change", "first-frame", "keyframe",
     "uniform", "gap-fill",
@@ -590,16 +589,24 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    # --fps reaches only the uniform fallback: the scene and keyframe engines
-    # select on content, not at a sample rate. Say so rather than accepting the
-    # flag and ignoring it — a silent no-op here is the same failure the motion
-    # dispatch above is deliberately ordered to avoid.
-    if args.fps is not None and not args.motion and frame_meta.get("engine") in ("scene", "keyframe"):
+    # --fps reaches only a uniform sampler running at the caller's rate. The
+    # scene and keyframe engines select on content; the keyframe engine's own
+    # uniform fallback derives its rate from auto_fps rather than from the
+    # caller. Keyed on what the engine reports rather than on its name, because
+    # two different code paths both call themselves "uniform" and only one of
+    # them honours the flag — that gap is why `--detail efficient --fps 1`
+    # silently did nothing on a static clip.
+    if args.fps is not None and not args.motion and frames and not frame_meta.get("fps_applied"):
+        engine = frame_meta.get("engine", "this")
+        why = (
+            f"the {engine} engine picks frames by content, not at a fixed rate"
+            if engine in ("scene", "keyframe")
+            else "this uniform fallback derives its own rate from the clip duration"
+        )
         print(
-            f"[watch] --fps {args.fps} had no effect: the {frame_meta['engine']} engine picks frames by "
-            "content, not at a fixed rate, and --fps binds only on the uniform fallback. Use "
-            "--max-frames to change how many frames you get, --detail token-burner to keep every "
-            "detected frame, or --start/--end to sample a window densely.",
+            f"[watch] --fps {args.fps} had no effect: {why}. Use --max-frames to change how "
+            "many frames you get, --detail token-burner to keep every detected frame, or "
+            "--start/--end to sample a window densely.",
             file=sys.stderr,
         )
 
@@ -667,7 +674,18 @@ def main() -> int:
             f"({effective_duration:.1f}s)"
         )
     if meta.get("width") and meta.get("height"):
-        print(f"- **Resolution:** {meta['width']}x{meta['height']} ({meta.get('codec') or 'unknown codec'})")
+        # Frame rate belongs here, not only under --motion. 24p / 30p / 60p is a
+        # first-order property of how a video was made and it cannot be recovered
+        # from the frames — they arrive as stills with no spacing information —
+        # so a question about pacing or feel had no way to reach it.
+        # %g so 30 prints as "30" and 30000/1001 as "29.97", rather than one of
+        # them carrying meaningless trailing zeros.
+        rate = meta.get("fps")
+        rate_note = f" @ {rate:g} fps" if rate else ""
+        print(
+            f"- **Resolution:** {meta['width']}x{meta['height']}{rate_note} "
+            f"({meta.get('codec') or 'unknown codec'})"
+        )
     if crop:
         cx, cy, cw, ch = crop
         # Source coordinates are stated so measured pixels can be converted back
@@ -857,11 +875,10 @@ def main() -> int:
         print(
             "**Read each frame path below with the Read tool to view the image.** "
             "Frames are in chronological order; `t=MM:SS.mmm` is the absolute timestamp in the "
-            "source video. `scene-change`, `first-frame`, `keyframe` and `motion` frames carry "
-            "ffmpeg's measured presentation time. `transcript-cue` and `gap-fill` frames carry "
-            "the time that was *requested* — the decoder returns the nearest frame at or after "
-            "it. `uniform` frames carry the time the sampler asked for, which can be early by "
-            "up to half its sampling interval."
+            "source video. `scene-change`, `first-frame`, `keyframe` and `uniform` frames carry "
+            "ffmpeg's measured presentation time, so the label is where the pixels are. "
+            "`transcript-cue` and `gap-fill` frames carry the time that was *requested* — the "
+            "decoder returns the nearest frame at or after it."
         )
         print()
         for frame in frames:

@@ -815,6 +815,37 @@ def format_time_ms(seconds: float) -> str:
     return f"{format_time(total_ms // 1000)}.{total_ms % 1000:03d}"
 
 
+_SCAN_TIME_RE = re.compile(r"time=(\d+):(\d\d):(\d\d(?:\.\d+)?)")
+
+
+def scan_duration(video_path: str) -> float:
+    """Recover a clip's length by demuxing it, for containers that omit it.
+
+    A duration is normally in the container header, but not always: piped output
+    and some OBS / browser recordings write a matroska or webm with
+    ``duration=N/A``. Everything downstream then divides by zero-ish — auto_fps
+    returns a target of 1, so a whole video comes back as a single frame, and the
+    report says "Duration: 00:00" about a clip that plainly is not.
+
+    Stream-copies the video stream to nothing and reads ffmpeg's own progress
+    clock, so this demuxes without decoding: measured 19ms on a 5.6s clip.
+    Returns 0.0 if that fails too, which leaves the caller exactly where it was.
+    """
+    if shutil.which("ffmpeg") is None:
+        return 0.0
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-v", "error", "-stats",
+         "-i", str(Path(video_path).resolve()),
+         "-map", "0:v:0", "-c", "copy", "-f", "null", "-"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    matches = _SCAN_TIME_RE.findall(result.stderr or "")
+    if not matches:
+        return 0.0
+    hours, minutes, seconds = matches[-1]
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+
+
 def get_metadata(video_path: str) -> dict:
     if shutil.which("ffprobe") is None:
         raise SystemExit("ffprobe is not installed. Install with: brew install ffmpeg")
@@ -840,6 +871,12 @@ def get_metadata(video_path: str) -> dict:
     audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), None)
 
     duration = float(fmt.get("duration") or video_stream.get("duration") or 0)
+    # Neither the container nor the stream declared one. Recover it by demuxing
+    # rather than carrying a zero through the whole pipeline, where it makes
+    # auto_fps target a single frame for the entire video. Only reached on
+    # headerless containers, and it costs a demux, not a decode.
+    if duration <= 0 and video_stream:
+        duration = scan_duration(video_path)
     return {
         "duration_seconds": duration,
         # Used by motion mode to decide whether the window fits under the cap at
@@ -911,6 +948,22 @@ def extract(
     crop: tuple[int, int, int, int] | None = None,
     end_seconds: float | None = None,
 ) -> list[dict]:
+    """Sample roughly ``fps`` frames a second, labelled with their measured times.
+
+    Selects the source's own frames at an interval rather than resampling to a
+    rate. ``-vf fps=N`` is a constant-frame-rate resampler: for each output slot
+    it duplicates or drops a source frame and stamps the copy with the *slot*
+    time, so the label says where the sampler asked rather than where the pixels
+    are. On a source that holds a frame between changes — every screen recording
+    — that is early by up to half a sampling period, and no amount of probing
+    recovers the real time because the resampler has already discarded it.
+    Measured on a clip with 317ms holds, ``fps=N`` labels were wrong by 304ms.
+
+    ``select`` passes source frames through untouched, so ``showinfo`` reports
+    each one's real presentation time. Same idiom as :func:`extract_motion`; the
+    difference is that this one thins to an interval and that one keeps
+    everything.
+    """
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
 
@@ -922,7 +975,7 @@ def extract(
     cmd: list[str] = [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel", "error",
+        "-loglevel", "info",          # showinfo writes at info level
         "-y",
     ]
 
@@ -932,10 +985,27 @@ def extract(
     if end_seconds is not None:
         cmd += ["-to", f"{end_seconds:.3f}"]
 
+    interval = 1.0 / fps if fps > 0 else 0.0
+    select = (
+        rf"select='isnan(prev_selected_t)+gte(t-prev_selected_t\,{interval:.6f})'"
+    )
     cmd += [
         "-i", str(Path(video_path).resolve()),
-        "-vf", f"fps={fps},{_crop_filter(crop)}{_scale_filter(resolution)}",
-        "-frames:v", str(max_frames),
+        # select BEFORE scale so discarded frames are never scaled or encoded;
+        # showinfo LAST so it reports only what actually gets written.
+        "-vf", f"{select},{_crop_filter(crop)}{_scale_filter(resolution)},showinfo",
+    ]
+    # Without this the image2 muxer expands the sparse selection back to constant
+    # frame rate and writes one JPEG per *source* frame — the same trap
+    # extract_motion documents, reached here the moment select replaced fps=N.
+    cmd += frame_sync_args()
+    # Deliberately no -frames:v. That flag stops ffmpeg after N frames, which
+    # truncates the tail of the clip rather than thinning across it: on a 3s
+    # source, `--max-frames 2` returned frames at 0.0 and 1.5 and nothing from
+    # the second half, while the report said "full range". The selection is
+    # thinned to the cap below instead, first and last kept — the same rule every
+    # other engine uses.
+    cmd += [
         "-q:v", "4",
         output_pattern,
     ]
@@ -945,23 +1015,27 @@ def extract(
         raise SystemExit(f"ffmpeg frame extraction failed: {result.stderr.strip()}")
 
     offset = start_seconds or 0.0
+    timestamps = [round(float(m.group(1)), 3) for m in SHOWINFO_TS_RE.finditer(result.stderr)]
     frames = sorted(out_dir.glob("frame_*.jpg"))
-    return [
-        {
+    out: list[dict] = []
+    for i, p in enumerate(frames):
+        if i < len(timestamps):
+            stamp = round(offset + timestamps[i], 3)
+        else:
+            # Lenient like the scene and keyframe engines rather than fatal like
+            # motion mode: this is the default path and a stamp shortfall should
+            # not lose the run. Falls back to the requested time — which is what
+            # every frame used to carry — rather than to the window start.
+            stamp = round(offset + (i * interval), 3)
+        out.append({
             "index": i,
-            # 3 decimals like every other engine, but note what this number is:
-            # `i / fps` is where the sampler *asked* for a frame, not where the
-            # returned pixels sit. `-vf fps=N` is a constant-frame-rate resampler
-            # that snaps each output slot to the nearest source frame, so on a
-            # source slower than the sample rate a label can be early by up to
-            # half a sampling period. The finer rounding does not fix that — it
-            # stops the label being quantised to 10ms on top of it.
-            "timestamp_seconds": round(offset + (i / fps if fps > 0 else 0.0), 3),
+            "timestamp_seconds": stamp,
             "path": str(p),
             "reason": "uniform",
-        }
-        for i, p in enumerate(frames)
-    ]
+        })
+    if max_frames is not None and len(out) > max_frames:
+        out = _even_sample(out, max_frames)
+    return out
 
 
 def extract_scene_candidates(
@@ -1588,6 +1662,11 @@ def extract_scene_or_uniform(
             # Independent of which frames survived — that is the point.
             "shots": shots,
             "fallback": False,
+            # Whether the caller's --fps governed anything. Reported rather than
+            # inferred from the engine name: the caller cannot tell a scene->uniform
+            # fallback (where fps binds) from a keyframe->uniform one (where the
+            # fallback computes its own rate) without knowing this file's internals.
+            "fps_applied": False,
             # The cap this engine actually enforced, and the duration budget it
             # actually consumed. Reported rather than recomputed by the caller
             # because `target_frames`/`fps` reach only the uniform fallback: the
@@ -1621,6 +1700,8 @@ def extract_scene_or_uniform(
         "engine": "uniform",
         "candidate_count": sampled_count,
         "scene_count": scene_count,
+        # This fallback samples at the caller's rate, so --fps really did bind.
+        "fps_applied": True,
         "deduped_count": n_dropped,
         "selected_count": len(frames),
         "fallback": True,
@@ -1749,6 +1830,10 @@ def extract_keyframes(
             frames_out, n_dropped = dedupe_perceptual(frames_out)
         return frames_out, {
             "engine": "uniform",
+            # NOT the caller's rate: this fallback derives its own from auto_fps
+            # a few lines above, so --fps is inert here even though the engine
+            # that ran is the one --fps normally drives.
+            "fps_applied": False,
             "candidate_count": sampled_count,
             "keyframe_count": len(candidates),
             "deduped_count": n_dropped,
@@ -1768,6 +1853,7 @@ def extract_keyframes(
     selected = _even_sample(deduped, cap)
     return selected, {
         "engine": "keyframe",
+        "fps_applied": False,
         "candidate_count": candidate_count,
         "deduped_count": n_dropped,
         "selected_count": len(selected),

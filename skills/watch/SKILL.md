@@ -250,7 +250,7 @@ At `balanced` / `token-burner` detail, the script extracts **scene-aware** frame
 
 ### Reading the report's numbers
 
-Every frame line is `t=MM:SS.mmm` — millisecond precision, because a clip that cuts more than once a second cannot be described in whole seconds. Scene, keyframe, cue and motion frames carry ffmpeg's *measured* presentation time; `reason=uniform` frames carry the time the sampler asked for, which can be early by up to half its sampling interval.
+Every frame line is `t=MM:SS.mmm` — millisecond precision, because a clip that cuts more than once a second cannot be described in whole seconds. Scene, keyframe, uniform and motion frames all carry ffmpeg's *measured* presentation time, so the label is where the pixels are rather than where the sampler asked. Cue and gap-fill frames carry the time that was requested; the decoder returns the nearest frame at or after it.
 
 `reason=` tells you where a frame came from, and they are not interchangeable:
 

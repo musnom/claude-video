@@ -471,3 +471,97 @@ def test_uncapped_fill_does_not_shrink_a_cut_heavy_clip(cut_clip: Path, tmp_path
     )
     assert len(out) == meta["candidate_count"] == 13
     assert meta["gap_filled"] == 0
+
+
+def test_uniform_frames_carry_measured_times_not_slot_times(vfr_clip: Path, tmp_path: Path):
+    """extract() selects source frames instead of resampling to a rate.
+
+    `-vf fps=N` stamps each output with its *slot* time, which on a held-frame
+    source is early by up to half a sampling period and unrecoverable afterwards.
+    The give-away is that measured times are not multiples of the interval: a
+    resampler's output always is.
+    """
+    out = frames.extract(
+        str(vfr_clip), tmp_path / "f", fps=4.0, max_frames=50,
+        start_seconds=0.0, end_seconds=3.0,
+    )
+    assert len(out) > 4
+    stamps = [f["timestamp_seconds"] for f in out]
+    assert stamps == sorted(stamps)
+    off_grid = [t for t in stamps if abs(t / 0.25 - round(t / 0.25)) > 0.01]
+    assert off_grid, f"every stamp landed on the 0.25s grid, so these are slot times: {stamps}"
+
+
+def test_uniform_cap_thins_across_the_clip_rather_than_truncating(
+    static_clip: Path, tmp_path: Path
+):
+    """`-frames:v N` stops ffmpeg after N frames, which keeps the FIRST N and
+    drops the tail. It only shows when the rate and the cap are set
+    independently — normally both derive from the same budget so the counts
+    match — but then it is severe: fps=2 with a cap of 3 on a 3s clip returned
+    0.0, 0.5, 1.0 and nothing from the last two thirds, while the report said
+    "full range"."""
+    out = frames.extract(str(static_clip), tmp_path / "f", fps=2.0, max_frames=3)
+    stamps = [f["timestamp_seconds"] for f in out]
+    assert len(out) == 3
+    assert stamps[0] == 0.0
+    assert stamps[-1] > 2.0, f"cap truncated the tail: {stamps}"
+    # _even_sample's cleanup contract: the frames it dropped are gone from disk.
+    assert len(list((tmp_path / "f").glob("frame_*.jpg"))) == 3
+    assert [f["index"] for f in out] == [0, 1, 2]
+
+
+def test_uniform_under_the_cap_is_untouched(static_clip: Path, tmp_path: Path):
+    out = frames.extract(str(static_clip), tmp_path / "f", fps=1.0, max_frames=100)
+    assert 1 < len(out) <= 100
+    assert [f["index"] for f in out] == list(range(len(out)))
+
+
+# --- containers with no duration header ---------------------------------------
+
+
+def test_headerless_container_really_has_no_duration(headerless_clip: Path):
+    """Fixture precondition: if ffprobe ever starts reporting a duration here,
+    the tests below stop testing anything."""
+    import subprocess as sp
+
+    declared = sp.run(
+        ["ffprobe", "-v", "quiet", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(headerless_clip)],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert declared in ("", "N/A"), f"container declared {declared!r}"
+
+
+def test_duration_is_recovered_by_demuxing(headerless_clip: Path):
+    """A zero duration used to propagate: auto_fps(0) targets one frame, so the
+    whole video came back as a single frame and the report said 00:00."""
+    meta = frames.get_metadata(str(headerless_clip))
+    assert meta["duration_seconds"] == pytest.approx(5.6, abs=0.4)
+    assert frames.auto_fps(meta["duration_seconds"])[1] > 1
+
+
+def test_scan_duration_is_a_demux_not_a_decode(headerless_clip: Path):
+    """It stream-copies to null, so it stays cheap enough to run on any clip
+    whose header is missing — measured 19ms on a 5.6s source."""
+    import time as _time
+
+    start = _time.perf_counter()
+    seconds = frames.scan_duration(str(headerless_clip))
+    assert seconds == pytest.approx(5.6, abs=0.4)
+    assert _time.perf_counter() - start < 2.0
+
+
+def test_scan_duration_returns_zero_on_junk(tmp_path: Path):
+    """Fail back to where the caller already was, never raise."""
+    junk = tmp_path / "junk.mkv"
+    junk.write_bytes(b"not a video\n" * 200)
+    assert frames.scan_duration(str(junk)) == 0.0
+
+
+def test_headerless_clip_gets_normal_frame_coverage(headerless_clip: Path, tmp_path: Path):
+    out, meta = frames.extract_scene_or_uniform(
+        str(headerless_clip), tmp_path / "f", fps=2.0, target_frames=20, max_frames=100,
+    )
+    assert len(out) > 5
+    assert max(f["timestamp_seconds"] for f in out) > 4.0
