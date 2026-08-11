@@ -189,8 +189,7 @@ def get_metadata(video_path: str) -> dict:
             "-show_streams",
             str(Path(video_path).resolve()),
         ],
-        capture_output=True,
-        text=True,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     if result.returncode != 0:
         raise SystemExit(f"ffprobe failed: {result.stderr.strip()}")
@@ -290,7 +289,7 @@ def extract(
         output_pattern,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise SystemExit(f"ffmpeg frame extraction failed: {result.stderr.strip()}")
 
@@ -354,7 +353,7 @@ def extract_scene_candidates(
         "-q:v", "4",
         output_pattern,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise SystemExit(f"ffmpeg scene extraction failed: {result.stderr.strip()}")
 
@@ -464,7 +463,7 @@ def extract_at_timestamps(
             "-q:v", "4",
             str(path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if result.returncode == 0 and path.exists():
             out.append({
                 "index": len(out),
@@ -542,6 +541,9 @@ def _thumb_frames(paths: list[Path]) -> list[bytes]:
         "-f", "rawvideo",
         "-",
     ]
+    # Intentionally no text=/encoding= here, unlike every other call in this
+    # module: stdout is raw grayscale pixel data that gets sliced by byte
+    # offset below. Decoding it as text would silently corrupt dedup.
     result = subprocess.run(cmd, capture_output=True)
     if result.returncode != 0:
         return []
@@ -711,7 +713,7 @@ def extract_keyframes(
         "-q:v", "4",
         output_pattern,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     # A range containing no keyframe (e.g. --start past the only one on a static
     # screen recording) starves the mjpeg encoder, so ffmpeg fails at encoder

@@ -29,7 +29,11 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from config import get_config  # noqa: E402
+from config import decode_env_bytes, ensure_utf8_console, get_config, read_env_file  # noqa: E402
+
+# Before any print: cmd_install writes an em dash and the config path, which
+# raise on a piped Windows console under the ANSI code page.
+ensure_utf8_console()
 
 
 REQUIRED_BINARIES = ["ffmpeg", "ffprobe", "yt-dlp"]
@@ -105,21 +109,10 @@ def _read_env_key(name: str) -> str | None:
     if not CONFIG_FILE.exists():
         return None
     _check_file_permissions(CONFIG_FILE)
-    try:
-        for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, raw = line.partition("=")
-            if key.strip() != name:
-                continue
-            raw = raw.strip()
-            if len(raw) >= 2 and raw[0] in ('"', "'") and raw[-1] == raw[0]:
-                raw = raw[1:-1]
-            return raw or None
-    except OSError:
-        return None
-    return None
+    # One parser for the whole codebase. This used to be a third private copy,
+    # which is how the inline-comment stripping added to read_env_file never
+    # reached the other two.
+    return read_env_file(CONFIG_FILE).get(name) or None
 
 
 def _have_api_key() -> tuple[bool, str | None]:
@@ -157,7 +150,9 @@ def _write_setup_complete() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     existing = ""
     if CONFIG_FILE.exists():
-        existing = CONFIG_FILE.read_text(encoding="utf-8")
+        # Decode defensively, then rewrite as UTF-8 — this self-heals a file
+        # PowerShell or Notepad wrote in UTF-16/BOM form.
+        existing = decode_env_bytes(CONFIG_FILE.read_bytes(), CONFIG_FILE)
         for line in existing.splitlines():
             if line.strip().startswith("SETUP_COMPLETE="):
                 return
