@@ -15,6 +15,8 @@ user-invocable: true
 
 You don't have a video input; this skill gives you one. A Python script gets captions first, optionally downloads the video, extracts frames as JPEGs (scene-aware, or fast keyframes at `efficient` detail), gets a timestamped transcript (native captions first, then Whisper API as fallback), and prints frame paths. You then `Read` each frame path to see the images and combine them with the transcript to answer the user.
 
+Visual frame selection alone misses moments the speaker *points at* ("look here", "as you can see") because those are often low visual change. So the normal run is **two passes**: pass one gets frames + transcript, then you scan the transcript for those cues and make a second, cheap pass that grabs a frame at each one. Step 3 below is that pass — it is part of the default flow, not an optional extra.
+
 ## Resolve `SKILL_DIR` (do this before any command)
 
 Every `python3 ...` command below runs a bundled script under `SKILL_DIR/scripts/`. Set `SKILL_DIR` to the **absolute path of the directory containing THIS SKILL.md you just Read** — your harness told you that path in the Read result. The scripts are always a direct sibling of this file (`SKILL_DIR/scripts/watch.py`), in every install layout:
@@ -142,12 +144,12 @@ python3 "${SKILL_DIR}/scripts/watch.py" "<source>"
 Optional flags:
 - `--detail transcript|efficient|balanced|token-burner` — fidelity/speed dial. `transcript` = no frames (transcript only, skips video download when captions exist); `efficient` = fast keyframes (cap 50); `balanced` = scene-aware frames (cap 100); `token-burner` = scene-aware, uncapped.
 - `--start T` / `--end T` — focus on a section. Accepts `SS`, `MM:SS`, or `HH:MM:SS`. When either is set, fps auto-scales denser (see "Focusing on a section" below).
-- `--timestamps T1,T2,…` — grab a frame at each of these absolute timestamps (`SS`, `MM:SS`, or `HH:MM:SS`). Use this after reading the transcript to capture deictic moments the presenter flags ("look here", "as you can see", "notice this") that visual selection alone may miss. See "Transcript-cue frames" below.
+- `--timestamps T1,T2,…` — grab a frame at each of these absolute timestamps (`SS`, `MM:SS`, or `HH:MM:SS`). This is what Step 3 uses to capture deictic moments the presenter flags ("look here", "as you can see", "notice this") that visual selection alone misses. See "Transcript-cue frames" below for the mechanics.
 - `--max-frames N` — override the preset cap for tighter token budget (e.g. `--max-frames 40`)
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
 - `--fps F` — override auto-fps (clamped to 2 fps max)
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
-- `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
+- `--whisper groq|openai|custom` — force a specific Whisper backend (default: a self-hosted endpoint if `WATCH_WHISPER_ENDPOINT` is set, else Groq, else OpenAI)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
 
@@ -180,17 +182,40 @@ python3 "${SKILL_DIR}/scripts/watch.py" "$URL" --start 2:15 --end 2:45 --fps 2
 python3 "${SKILL_DIR}/scripts/watch.py" "$URL" --start 1:12:00
 ```
 
-**Step 3 — Read every frame path the script lists.** The Read tool renders JPEGs directly as images for you. Read all frames in a single message (parallel tool calls) so you see them together. The frames are in chronological order with a `t=MM:SS` timestamp so you can align them to the transcript.
+**Step 3 — transcript-cue pass (do this by default).** Pass one gave you a timestamped transcript. Read it now, *before* reading the frames, and scan for **deictic cues** — moments where the speaker directs attention at something on screen: "look here", "as you can see", "notice this", "watch what happens", "right here", "this bit". These are exactly the frames scene selection misses, because pointing at a slide barely changes the picture.
 
-**Step 4 — answer the user.** You now have two streams of evidence:
+This is a judgment call, which is why you do it and not a regex — ignore rhetorical uses ("look, the point is…") and cues that land on a frame you already have.
+
+If you find any, make a second **cue-only** pass. It extracts *just* those frames and nothing else, so it is cheap:
+
+```bash
+python3 "${SKILL_DIR}/scripts/watch.py" "<work-dir>/download/video.mp4" \
+  --detail transcript --timestamps 4:32,7:10,9:55 --no-whisper
+```
+
+- **Point it at the downloaded file, not the URL** — `<work-dir>` is the directory the pass-one report printed at the bottom; the video lands at `download/video.*` inside it. Re-passing the URL would download the whole thing again.
+- **`--detail transcript` makes it cue-only** — it skips scene/keyframe sampling entirely and returns only your timestamps, so you get no duplicate frames from pass one.
+- **`--no-whisper`** — you already have the transcript; this stops a redundant transcription attempt.
+- Keep it to roughly the **10 strongest cues**. Every cue frame is a real token cost, and they are pinned against the frame cap.
+- Timestamps are absolute source times, in the same coordinates the transcript uses.
+
+**Skip this step when** any of these hold — say nothing about skipping, just move on:
+- The transcript came back "none available" (nothing to scan).
+- The user explicitly asked for `--detail transcript` (they asked for no frames; don't hand them frames anyway).
+- You scanned and found no genuine deictic cues.
+- The user asked a narrow question that the pass-one frames already answer.
+
+**Step 4 — Read every frame path the script lists.** The Read tool renders JPEGs directly as images for you. Read all frames — from both passes — in a single message (parallel tool calls) so you see them together. The frames are in chronological order with a `t=MM:SS` timestamp so you can align them to the transcript; cue frames are marked `reason=transcript-cue`.
+
+**Step 5 — answer the user.** You now have two streams of evidence:
 - **Frames** — what's on screen at each timestamp
-- **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)` or `whisper (openai)` = transcribed by API).
+- **Transcript** — what's said at each timestamp. The report's header shows the source (`captions` = yt-dlp pulled native subs; `whisper (groq)`, `whisper (openai)` or `whisper (custom)` = transcribed by an API, where `custom` is a self-hosted server).
 
 If the user asked a specific question, answer it directly citing timestamps. If they didn't ask anything, summarize what happens in the video — structure, key moments, notable visuals, spoken content.
 
 This holds for `transcript` detail too: even with no frames, produce a **summary** like the other modes — do not paste the full transcript into chat. Synthesize structure, key moments, and spoken content with timestamps; quote only the lines that matter. Offer the raw transcript only if the user explicitly asks for it.
 
-**Step 5 — clean up.** The script prints a working directory at the end. If the user isn't going to ask follow-ups about this video, delete it with `rm -rf <dir>`. If they might, leave it in place.
+**Step 6 — clean up.** Each pass prints a working directory at the end. If the user isn't going to ask follow-ups about this video, delete them with `rm -rf <dir>`. If they might, leave them in place.
 
 ## Detail and frames
 
@@ -206,11 +231,9 @@ At `balanced` / `token-burner` detail, the script extracts **scene-aware** frame
 
 ## Transcript-cue frames
 
-Visual frame selection (scene/keyframe) can miss the moments a presenter explicitly flags — "look here", "as you can see", "notice this", "watch what happens" — because pointing at a slide is often a *low* visual change. `--timestamps` lets you force a frame at those exact moments. **You** decide which moments matter, by reading the transcript:
+Reference for the mechanics behind **Step 3** — which runs by default on every watch that produces a transcript, not only when the user asks for it.
 
-1. Run once at `--detail transcript` (or any detail) to get the timestamped transcript.
-2. Scan it for deictic cues — phrases where the speaker directs attention to something on screen. This is a judgment call (ignore rhetorical "look, the point is…"); that's why it's done by you, not a regex.
-3. Re-run with `--timestamps 4:32,7:10,9:55` (absolute source times). For a URL, point the second run at the **downloaded local file** in the work dir so it doesn't re-download.
+Visual frame selection (scene/keyframe) misses the moments a presenter explicitly flags — "look here", "as you can see", "notice this", "watch what happens" — because pointing at a slide is often a *low* visual change. `--timestamps` forces a frame at those exact moments. **You** decide which moments matter, by reading the transcript; see Step 3 for the flow and the skip conditions.
 
 Behavior:
 - **Additive by default.** Cue frames (`reason=transcript-cue`) are merged into whatever `--detail` already selected, in chronological order.
@@ -223,11 +246,14 @@ Behavior:
 The script gets a timestamped transcript in one of two ways:
 
 1. **Native captions (free, preferred).** yt-dlp pulls manual or auto-generated subtitles from the source platform if available.
-2. **Whisper API fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever Whisper API has a key configured:
-   - **Groq** — `whisper-large-v3`. Preferred default: cheaper, faster. Get a key at console.groq.com/keys.
-   - **OpenAI** — `whisper-1`. Fallback. Get a key at platform.openai.com/api-keys.
+2. **Whisper fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever backend is configured:
+   - **Self-hosted** — any OpenAI-compatible `/v1/audio/transcriptions` server (whisper.cpp's `whisper-server`, speaches, LocalAI, vLLM). Set `WATCH_WHISPER_ENDPOINT` to its URL. **No API key and no data leaves the machine.** Takes priority when set, since pointing this at localhost is a deliberate act. Model defaults to `whisper-1`; override with `WATCH_WHISPER_MODEL`.
+   - **Groq** — `whisper-large-v3`. Preferred cloud default: cheaper, faster. Get a key at console.groq.com/keys.
+   - **OpenAI** — `whisper-1`. Cloud fallback. Get a key at platform.openai.com/api-keys.
 
-Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are set; override with `--whisper openai` to force OpenAI. Use `--no-whisper` to skip the fallback entirely.
+All three settings live in `~/.config/watch/.env`. Override the automatic choice with `--whisper groq|openai|custom`, or use `--no-whisper` to skip the fallback entirely.
+
+**If the user wants local-only transcription**, point them at `WATCH_WHISPER_ENDPOINT` rather than suggesting a Python package — the existing client already speaks the protocol every local Whisper server exposes, so nothing needs installing beyond the server itself.
 
 ## Failure modes and handling
 
@@ -251,17 +277,19 @@ If you already watched a video this session and the user asks a follow-up, do **
 **What this skill does:**
 - Runs `yt-dlp` locally to download the video and pull native captions when the source supports them (public data; the request goes directly to whatever host the URL points at)
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
-- Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
-- Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
+- Sends the extracted audio clip to the URL in `WATCH_WHISPER_ENDPOINT` when that is set — and to nowhere else. This is the user's own server; if it is on localhost, no audio leaves the machine. No `Authorization` header is sent unless a key is configured
+- Otherwise sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
+- Otherwise sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set, or when `--whisper openai` is forced
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
-- Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s) and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
+- Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s), an optional self-hosted endpoint, and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`
 - Does not access any platform account (no login, no session cookies, no posting) — yt-dlp only ever requests public data
-- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`)
+- Does not share API keys between providers (Groq key only goes to `api.groq.com`, OpenAI key only goes to `api.openai.com`, and a self-hosted endpoint is sent no key at all)
+- Does not contact any third party when `WATCH_WHISPER_ENDPOINT` is set — that setting replaces the cloud backends rather than supplementing them
 - Does not log, cache, or write API keys to stdout, stderr, or output files
-- Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 5)
+- Does not persist anything outside the working directory and `~/.config/watch/.env` — clean up the working directory when you're done (Step 6)
 
 **Bundled scripts:** `scripts/watch.py` (entry point), `scripts/download.py` (yt-dlp wrapper), `scripts/frames.py` (ffmpeg frame extraction), `scripts/transcribe.py` (caption selection + Whisper orchestration), `scripts/whisper.py` (Groq / OpenAI clients), `scripts/setup.py` (preflight + installer)
 
