@@ -1,3 +1,13 @@
+# Line endings.
+#
+# Git for Windows installs with core.autocrlf=true by default, which would check
+# these out as CRLF. hooks/hooks.json runs `bash .../check-setup.sh`, and bash
+# dies on `set -euo pipefail\r` with "set: pipefail: invalid option name" before
+# the hook evaluates anything — so a Windows clone silently loses the SessionStart
+# hook. eol=lf pins the checkout regardless of the user's autocrlf setting.
+*.sh  text eol=lf
+*.py  text eol=lf
+
 # Exclude non-runtime files from `git archive` output.
 # Used by skills/watch/scripts/build-skill.sh to produce the claude.ai .skill file
 # and by Claude Code's /plugin install (full-repo archive).

@@ -1,4 +1,5 @@
-"""Shared pytest fixtures: ffmpeg-synthesized clips and scripts/ on sys.path."""
+"""Shared pytest fixtures: environment isolation, ffmpeg-synthesized clips, and
+scripts/ on sys.path."""
 from __future__ import annotations
 
 import subprocess
@@ -10,6 +11,41 @@ import pytest
 # Make the bundled scripts importable (mirrors watch.py's sys.path insert).
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "skills" / "watch" / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
+
+# Config keys /watch reads from the environment. Any of these leaking in from the
+# developer's shell changes what the code under test does.
+WATCH_ENV_VARS = (
+    "WATCH_DETAIL",
+    "GROQ_API_KEY",
+    "OPENAI_API_KEY",
+    "SETUP_COMPLETE",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch):
+    """Run every test against an empty HOME with no /watch env vars set.
+
+    Without this the suite reads the developer's real ``~/.config/watch/.env``:
+    the subprocess-driven tests in test_setup.py and test_watch.py inherit HOME,
+    and ``whisper.load_api_key`` resolves ``Path.home()`` at call time. A machine
+    with ``WATCH_DETAIL=transcript`` configured fails four tests on a clean
+    checkout, because /watch then extracts no frames.
+
+    This is a *baseline* only. Tests that need a populated config still override
+    HOME themselves (test_setup.py's ``_run(home=...)``) or monkeypatch the
+    module constant (test_config.py) — both take precedence over this fixture,
+    so no test loses its intent.
+
+    USERPROFILE is set alongside HOME because that is what ``Path.home()``
+    consults on Windows.
+    """
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    for name in WATCH_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    return home
 
 # 14 visually distinct fills → 14 abrupt cuts → x264 emits a keyframe per cut.
 COLORS = [

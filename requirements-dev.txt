@@ -1,0 +1,11 @@
+# Development dependencies for the /watch test suite.
+#
+# The skill itself is pure stdlib — nothing here ships to any install surface.
+# Runtime deps are external binaries (ffmpeg, ffprobe, yt-dlp), installed by
+# skills/watch/scripts/setup.py.
+#
+#   python3 -m venv .venv
+#   .venv/bin/python -m pip install -r requirements-dev.txt
+#   .venv/bin/pytest -q
+
+pytest>=8.0
