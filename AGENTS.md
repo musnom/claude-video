@@ -15,6 +15,24 @@ Agent Skills package that gives an agent a video input. Installable across Claud
 - `CLAUDE.md` → `@AGENTS.md` — generic-agent entry point.
 - `tests/` — pytest suite (ffmpeg-synthesized clips; no network).
 
+## Scope: macOS only (current focus)
+
+**Target macOS. Do not spend effort on Windows or Linux.**
+
+If a bug only affects Windows or Linux, note it and move on. Don't fix it,
+don't write tests for it, don't add platform branches for it. Ask before
+starting any cross-platform work.
+
+Two things this does *not* mean:
+
+- Don't remove the Windows and Linux fixes already in the tree (0.3.0). They
+  work, they're tested, and they cost nothing to keep.
+- Don't break other platforms on purpose. Keep the code portable where that's
+  free; just don't invest in it.
+
+CI still runs on ubuntu / macOS / windows. macOS is the one that matters — a
+red Windows run is information, not a blocker.
+
 ## Orientation
 
 - The product is the slash-command-invoked skill (`/watch <url-or-path> [question]`), not a CLI. `scripts/watch.py` is implementation. Features must work across every harness the skill installs into, not just Claude Code.
