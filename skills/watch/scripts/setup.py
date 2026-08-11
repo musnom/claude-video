@@ -56,6 +56,13 @@ ENV_TEMPLATE = """# /watch API configuration
 GROQ_API_KEY=
 OPENAI_API_KEY=
 
+# Self-hosted / fully local transcription. Point this at any OpenAI-compatible
+# /v1/audio/transcriptions server — whisper.cpp's whisper-server, speaches,
+# LocalAI, vLLM — and audio never leaves your machine. No API key is sent.
+# Takes priority over the cloud backends above when set.
+# WATCH_WHISPER_ENDPOINT=http://127.0.0.1:8080/v1/audio/transcriptions
+# WATCH_WHISPER_MODEL=whisper-1
+
 # Default watch behavior (the /watch first-run wizard sets this for you).
 # Allowed values: transcript | efficient | balanced | token-burner
 # Keep the value on its own line with no trailing comment.
@@ -116,6 +123,14 @@ def _read_env_key(name: str) -> str | None:
 
 
 def _have_api_key() -> tuple[bool, str | None]:
+    """Whether transcription is reachable, and by which backend.
+
+    A configured self-hosted endpoint counts: it needs no key, and without this
+    such a user reads as `needs_key`/`can_proceed: false` and gets nagged for a
+    cloud key on every first run.
+    """
+    if _read_env_key("WATCH_WHISPER_ENDPOINT"):
+        return True, "custom"
     if _read_env_key("GROQ_API_KEY"):
         return True, "groq"
     if _read_env_key("OPENAI_API_KEY"):

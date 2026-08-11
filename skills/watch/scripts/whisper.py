@@ -37,6 +37,37 @@ GROQ_MODEL = "whisper-large-v3"
 OPENAI_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 OPENAI_MODEL = "whisper-1"
 
+# Self-hosted / local transcription. _post_whisper already speaks exactly the
+# OpenAI multipart + verbose_json protocol that whisper.cpp's whisper-server,
+# speaches, LocalAI and vLLM all expose, so the only thing standing between this
+# script and fully-local transcription is one hardcoded URL — no new dependency,
+# no second segment parser, no engine-detection table.
+CUSTOM_ENDPOINT_VAR = "WATCH_WHISPER_ENDPOINT"
+CUSTOM_MODEL_VAR = "WATCH_WHISPER_MODEL"
+CUSTOM_MODEL_DEFAULT = "whisper-1"
+
+
+def _setting(name: str) -> str | None:
+    """Read a setting from the environment, else ~/.config/watch/.env or ./.env.
+
+    Routed through config.read_env_file rather than a private parser so the
+    quote and inline-comment handling is shared — a trailing `  # local box`
+    otherwise ends up inside the URL.
+    """
+    value = os.environ.get(name)
+    if value and value.strip():
+        return value.strip()
+    for path in (Path.home() / ".config" / "watch" / ".env", Path.cwd() / ".env"):
+        value = read_env_file(path).get(name)
+        if value:
+            return value
+    return None
+
+
+def custom_endpoint() -> str | None:
+    """The configured self-hosted transcription URL, if any."""
+    return _setting(CUSTOM_ENDPOINT_VAR)
+
 # Both Groq's free tier and OpenAI whisper-1 cap uploads at 25 MB. We target a
 # margin under that so multipart framing overhead never pushes a chunk over.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
@@ -70,8 +101,15 @@ def plan_chunks(
 def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, None]:
     """Return (backend, api_key). Prefers Groq, falls back to OpenAI.
 
-    If `preferred` is "groq" or "openai", only that backend's key is considered.
+    If `preferred` is "groq", "openai" or "custom", only that backend is
+    considered. A configured self-hosted endpoint wins over the cloud backends
+    when nothing was forced — someone who pointed this at localhost meant it —
+    and returns an empty key, since local servers do not require one.
     """
+    if preferred == "custom" or (preferred is None and custom_endpoint()):
+        if custom_endpoint():
+            return "custom", ""
+        return None, None
     def _from_env(name: str) -> str | None:
         value = os.environ.get(name)
         return value.strip() if value else None
@@ -234,13 +272,17 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
     }
     body, boundary = _build_multipart(fields, audio_path)
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "Content-Type": f"multipart/form-data; boundary={boundary}",
         # Groq sits behind Cloudflare — the default `Python-urllib/3.x` UA
         # trips WAF rule 1010 (403) before auth even runs. Any non-default
         # UA clears it; we identify honestly.
         "User-Agent": "watch-skill/1.0 (+claude-code; python-urllib)",
     }
+    # Omit the header entirely rather than sending a placeholder: local servers
+    # do not want one, and a fake bearer token is the kind of thing that gets
+    # logged or rejected.
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     context = ssl.create_default_context()
     rate_limit_hits = 0
@@ -398,6 +440,15 @@ def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]
         response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
     elif backend == "openai":
         response = _post_whisper(OPENAI_ENDPOINT, api_key, OPENAI_MODEL, audio_path)
+    elif backend == "custom":
+        endpoint = custom_endpoint()
+        if not endpoint:
+            raise SystemExit(
+                f"--whisper custom needs {CUSTOM_ENDPOINT_VAR} set to an "
+                "OpenAI-compatible /v1/audio/transcriptions URL"
+            )
+        model = _setting(CUSTOM_MODEL_VAR) or CUSTOM_MODEL_DEFAULT
+        response = _post_whisper(endpoint, api_key, model, audio_path)
     else:
         raise SystemExit(f"Unknown whisper backend: {backend}")
     return _segments_from_response(response)
@@ -418,11 +469,14 @@ def transcribe_video(
         backend = backend or detected_backend
         api_key = api_key or detected_key
 
-    if not backend or not api_key:
+    # The custom backend is deliberately exempt from the key requirement: a
+    # local server does not issue one.
+    if not backend or (not api_key and backend != "custom"):
         setup_py = Path(__file__).resolve().parent / "setup.py"
         raise SystemExit(
             "No Whisper API key available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
-            "in the environment or in ~/.config/watch/.env. "
+            f"in the environment or in ~/.config/watch/.env, or point {CUSTOM_ENDPOINT_VAR} "
+            "at a self-hosted OpenAI-compatible server. "
             f"Run `python3 {setup_py}` to configure."
         )
 

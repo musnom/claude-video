@@ -62,9 +62,10 @@ def main() -> int:
     )
     ap.add_argument(
         "--whisper",
-        choices=["groq", "openai"],
+        choices=["groq", "openai", "custom"],
         default=None,
-        help="Force a specific Whisper backend. Default: prefer Groq, fall back to OpenAI.",
+        help="Force a specific Whisper backend. Default: a self-hosted endpoint if "
+             "WATCH_WHISPER_ENDPOINT is set, else Groq, else OpenAI.",
     )
     ap.add_argument(
         "--no-dedup",
@@ -244,7 +245,8 @@ def main() -> int:
 
     if not transcript_segments and not args.no_whisper and video_path and meta.get("has_audio"):
         backend, api_key = load_api_key(args.whisper)
-        if backend and api_key:
+        # A self-hosted endpoint has no key, so `custom` is enough on its own.
+        if backend and (api_key or backend == "custom"):
             try:
                 all_segments, used_backend = transcribe_video(
                     video_path,
