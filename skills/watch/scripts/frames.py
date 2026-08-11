@@ -8,6 +8,7 @@ zooming in for detail).
 """
 from __future__ import annotations
 
+import functools
 import json
 import re
 import shutil
@@ -37,6 +38,98 @@ MAX_READ_DIMENSION = 1998
 DEDUP_THUMB = 16
 DEDUP_THRESHOLD = 2.0
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
+
+# --- ffmpeg frame-sync flag compatibility ------------------------------------
+# ffmpeg 5.1 renamed the global -vsync to the per-file -fps_mode, and 9.0 REMOVED
+# -vsync outright. -fps_mode does not exist before 5.1, and Ubuntu 22.04 LTS
+# still ships 4.4.2 (supported through 2027) — so neither spelling works
+# everywhere and we have to ask the local binary which one it takes.
+#
+# The flag is load-bearing, not cosmetic: without it the image2 muxer runs our
+# sparse select/keyframe output through constant-frame-rate sync and writes one
+# JPEG per *source* frame instead of one per *selected* frame. Measured on a 9s
+# three-cut clip through the real scene filter: 224 JPEGs with no flag, 3 with
+# either spelling.
+FRAME_SYNC_MODE = "vfr"
+_FRAME_SYNC_OPTIONS = ("fps_mode", "vsync")  # preference order: modern first
+
+
+@functools.lru_cache(maxsize=None)
+def _ffmpeg_accepts_option(name: str) -> bool:
+    """True if the local ffmpeg recognizes ``-<name> <FRAME_SYNC_MODE>``.
+
+    Runs a ~17ms one-frame null job with the exact flag/value pair we intend to
+    emit, so a success proves the pair works end to end.
+
+    On a non-zero exit we deny support only when ffmpeg explicitly named the
+    option as unrecognized. Two reasons that beats checking the exit code:
+    argument splitting happens before any input is opened, so the message
+    appears even on a build without lavfi; and the code itself is not stable
+    (unrecognized-option exits 8 on 8.1.1 but 1 on 4.x), which is the exact
+    version-coupling this function exists to remove.
+
+    Every other failure is inconclusive and we keep the flag. If it truly were
+    unsupported the extraction call fails exactly as it does today, whereas
+    guessing "unsupported" would hand an ffmpeg 9 a removed option and
+    guarantee the failure this probe exists to prevent.
+
+    Deliberately not a version-banner or ``-h full`` parse: banners are
+    unparseable on git and distro builds (``N-109871-g<sha>``,
+    ``n4.4.2-0ubuntu0.22.04.1``) and defeated by backports, while ``-h full`` is
+    ~1MB of help text whose formatting is not a stable API — and a naive
+    ``vsync`` grep there also matches the unrelated ``avsynctest`` filter.
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "lavfi", "-i", "nullsrc=d=0.04",
+        "-frames:v", "1",
+        f"-{name}", FRAME_SYNC_MODE,
+        "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    except OSError:
+        # Cannot spawn at all; the callers' shutil.which guard reports it with a
+        # far better message than anything we could raise from here.
+        return True
+    if result.returncode == 0:
+        return True
+    return f"Unrecognized option '{name}'" not in (result.stderr or "")
+
+
+@functools.lru_cache(maxsize=None)
+def frame_sync_args() -> tuple[str, ...]:
+    """The frame-sync argv pair this ffmpeg understands, or ``()`` if neither.
+
+    Prefers ``-fps_mode``. Both call sites run at ``-loglevel info`` because they
+    parse ``showinfo`` out of stderr, and at that level ``-vsync`` writes
+    "-vsync is deprecated. Use -fps_mode" into the very stream SHOWINFO_TS_RE
+    scans. It does not corrupt parsing today, but it is needless coupling and it
+    pollutes the stderr we surface in SystemExit messages.
+
+    Memoized per process: watch.py is one process per /watch and this module
+    spawns ffmpeg 3-5 times per run, so one probe amortizes away. Deliberately
+    not persisted to disk — such a cache goes stale the moment the user upgrades
+    ffmpeg, reintroducing the exact fatal mismatch this prevents.
+
+    Returns a tuple rather than a list so the cached value cannot be mutated by
+    a caller.
+    """
+    for name in _FRAME_SYNC_OPTIONS:
+        if _ffmpeg_accepts_option(name):
+            return (f"-{name}", FRAME_SYNC_MODE)
+    # No released ffmpeg lands here. Degrade rather than raise: extraction still
+    # succeeds, it just emits one JPEG per source frame. Those duplicates are
+    # byte-identical, so dedupe_perceptual (on by default) collapses them and
+    # _even_sample enforces the cap. The cost is decode time, not correctness.
+    print(
+        "[watch] this ffmpeg accepts neither -fps_mode nor -vsync; frame "
+        "selection may emit duplicate frames (dedup collapses them)",
+        file=sys.stderr,
+    )
+    return ()
 
 
 def _scale_filter(resolution: int) -> str:
@@ -253,8 +346,8 @@ def extract_scene_candidates(
     cmd += [
         "-i", str(Path(video_path).resolve()),
         "-vf", vf,
-        "-vsync", "vfr",
     ]
+    cmd += frame_sync_args()
     if max_frames is not None:
         cmd += ["-frames:v", str(max_frames)]
     cmd += [
@@ -612,17 +705,39 @@ def extract_keyframes(
         "-skip_frame", "nokey",
         "-i", str(Path(video_path).resolve()),
         "-vf", f"{_scale_filter(resolution)},showinfo",
-        "-vsync", "vfr",
+    ]
+    cmd += frame_sync_args()
+    cmd += [
         "-q:v", "4",
         output_pattern,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # A range containing no keyframe (e.g. --start past the only one on a static
+    # screen recording) starves the mjpeg encoder, so ffmpeg fails at encoder
+    # init instead of exiting 0 with no output — which made the
+    # `len(candidates) < KEYFRAME_MIN` fallback below unreachable in exactly the
+    # case it was written for, while `balanced` handled the same window fine.
+    #
+    # Gate on "produced no files" rather than on ffmpeg's wording: the message
+    # is itself version-coupled (8.x says "Could not open encoder before EOF",
+    # older builds said "No filtered frames for output stream"). The glob is
+    # trustworthy because every frame_*.jpg in out_dir was deleted above, and
+    # cue frames use a cue_*.jpg prefix — so a non-empty glob provably means
+    # this invocation wrote something. Partial output still raises, unchanged.
+    files = sorted(out_dir.glob("frame_*.jpg"))
     if result.returncode != 0:
-        raise SystemExit(f"ffmpeg keyframe extraction failed: {result.stderr.strip()}")
+        if files:
+            raise SystemExit(f"ffmpeg keyframe extraction failed: {result.stderr.strip()}")
+        detail = (result.stderr or "").strip().splitlines()
+        print(
+            "[watch] no keyframes decoded in range — falling back to uniform "
+            f"sampling ({detail[-1] if detail else 'no ffmpeg output'})",
+            file=sys.stderr,
+        )
 
     offset = start_seconds or 0.0
     timestamps = [round(offset + float(m.group(1)), 2) for m in SHOWINFO_TS_RE.finditer(result.stderr)]
-    files = sorted(out_dir.glob("frame_*.jpg"))
     candidates: list[dict] = []
     for i, path in enumerate(files):
         ts = timestamps[i] if i < len(timestamps) else offset
