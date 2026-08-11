@@ -72,7 +72,16 @@ _PERM_WARNED: set[str] = set()
 
 def _check_file_permissions(path: Path) -> None:
     """Warn to stderr (once per path per process) if a secrets file is
-    world/group readable."""
+    world/group readable.
+
+    POSIX only. Windows has no st_mode — CPython synthesizes 0o666 for any
+    writable file (0o444 if read-only), so `mode & 0o044` is unconditionally
+    true there and every Windows user gets a warning on every run telling them
+    to run `chmod 600`, which cannot clear it (chmod only toggles the READONLY
+    attribute). Access control on NTFS is an ACL, which this check cannot read.
+    """
+    if os.name == "nt":
+        return
     key = str(path)
     if key in _PERM_WARNED:
         return
