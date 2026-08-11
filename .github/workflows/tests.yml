@@ -35,15 +35,17 @@ jobs:
         with:
           python-version: "3.12"
 
-      # The suite has no shutil.which guards — the session fixtures synthesize
-      # clips with ffmpeg, so it is a hard requirement, not an optional extra.
-      - name: Install ffmpeg
-        run: brew install ffmpeg
+      # Both are hard requirements, not optional extras: the session fixtures
+      # synthesize clips with ffmpeg, and setup.py's preflight checks for
+      # yt-dlp on PATH. Same packages setup.py installs on macOS.
+      - name: Install ffmpeg and yt-dlp
+        run: brew install ffmpeg yt-dlp
 
       - name: Verify toolchain
         run: |
-          ffmpeg -version
-          ffprobe -version
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+          yt-dlp --version
         shell: bash
 
       - name: Install test dependencies
