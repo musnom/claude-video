@@ -34,6 +34,54 @@ VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
 SUB_LANGS = ".*-orig,en,en-US,en-GB"
 
 
+def cookie_args(
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
+) -> list[str]:
+    """yt-dlp argv for an opt-in cookie source, or ``[]``.
+
+    Opt-in only, deliberately. Probing browsers automatically when a download
+    fails would read a cookie jar because a site returned 403 — on macOS each
+    probe can raise a Keychain prompt, and "the tool read my browser profile" is
+    not a thing to do on inference.
+
+    ``cookies_from_browser`` is forwarded verbatim, including yt-dlp's
+    ``BROWSER[+KEYRING][:PROFILE][::CONTAINER]`` syntax; yt-dlp validates the
+    browser name and reports a better error than a re-implementation of its table
+    would.
+
+    The leading-dash check is defence in depth, not a patched hole. Checked
+    against the real binary: ``yt-dlp --cookies-from-browser --config-location
+    URL`` does **not** smuggle an option in — optparse takes the next token as the
+    option's value and yt-dlp then rejects it with "unsupported browser
+    specified". So this guard is not what stands between a caller and an
+    arbitrary yt-dlp option today; it fails faster, with a message that names the
+    flag the caller actually typed, and it keeps that true if yt-dlp's argument
+    handling ever changes. An earlier version of this docstring claimed the
+    stronger thing, which was wrong.
+
+    Values are appended as single argv elements and never interpolated into a
+    shell string — subprocess is called with a list throughout this module.
+    """
+    args: list[str] = []
+    for flag, value in (("--cookies-from-browser", cookies_from_browser), ("--cookies", cookies_file)):
+        if not value:
+            continue
+        text = str(value).strip()
+        if text.startswith("-"):
+            raise SystemExit(
+                f"{flag} value may not start with '-' (got {text!r}) — yt-dlp would read "
+                "it as another option rather than as a value."
+            )
+        if flag == "--cookies":
+            path = Path(text).expanduser()
+            if not path.is_file():
+                raise SystemExit(f"--cookies file not found: {path}")
+            text = str(path.resolve())
+        args += [flag, text]
+    return args
+
+
 def is_url(source: str) -> bool:
     if source.startswith("-"):
         return False
@@ -89,7 +137,12 @@ def _pick_video(out_dir: Path) -> Path | None:
     return None
 
 
-def fetch_captions(url: str, out_dir: Path) -> dict:
+def fetch_captions(
+    url: str,
+    out_dir: Path,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
+) -> dict:
     """Fetch metadata and best available VTT captions without downloading video."""
     if shutil.which("yt-dlp") is None:
         raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
@@ -108,9 +161,11 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
         "--no-playlist",
         "--ignore-errors",
         "-o", output_template,
-        "--",
-        url,
     ]
+    # Before the "--" terminator, so they are read as options; the URL stays the
+    # only positional argument.
+    cmd += cookie_args(cookies_from_browser, cookies_file)
+    cmd += ["--", url]
     subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
     subtitle = _pick_subtitle(out_dir)
     info = _read_info(out_dir / "video.info.json", url)
@@ -123,6 +178,18 @@ def fetch_captions(url: str, out_dir: Path) -> dict:
 
 
 def _read_info(info_path: Path, url: str) -> dict:
+    """Narrow yt-dlp's info dict to the fields the rest of /watch reads.
+
+    ``is_live`` / ``live_status`` are here so a live URL can be refused *before*
+    the download rather than after it hangs: yt-dlp given a live stream records
+    until the stream ends, which for a 24/7 channel is never. ``fetch_captions``
+    already asks for the info JSON with ``--skip-download``, so both are free at
+    that point — they were simply being dropped on the floor.
+
+    ``width`` / ``height`` / ``vcodec`` come along because they answer "is there
+    a video stream at all" for a source we have not downloaded yet, and cost
+    nothing once the dict is open.
+    """
     info: dict = {}
     if info_path.exists():
         try:
@@ -132,6 +199,11 @@ def _read_info(info_path: Path, url: str) -> dict:
                 "uploader": raw.get("uploader") or raw.get("channel"),
                 "duration": raw.get("duration"),
                 "url": raw.get("webpage_url") or url,
+                "is_live": raw.get("is_live"),
+                "live_status": raw.get("live_status"),
+                "width": raw.get("width"),
+                "height": raw.get("height"),
+                "vcodec": raw.get("vcodec"),
             }
         except Exception as exc:
             print(f"[watch] info.json parse failed: {exc}", file=sys.stderr)
@@ -143,6 +215,8 @@ def download_url(
     url: str,
     out_dir: Path,
     audio_only: bool = False,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
 ) -> dict:
     if shutil.which("yt-dlp") is None:
         raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
@@ -165,9 +239,9 @@ def download_url(
         "--no-playlist",
         "--ignore-errors",
         "-o", output_template,
-        "--",
-        url,
     ]
+    cmd += cookie_args(cookies_from_browser, cookies_file)
+    cmd += ["--", url]
 
     # yt-dlp may exit non-zero if a subtitle variant fails (e.g. 429) even when
     # the video itself downloaded fine. Treat "video file present" as success.
@@ -193,9 +267,15 @@ def download(
     source: str,
     out_dir: Path,
     audio_only: bool = False,
+    cookies_from_browser: str | None = None,
+    cookies_file: str | None = None,
 ) -> dict:
     if is_url(source):
-        return download_url(source, out_dir, audio_only=audio_only)
+        return download_url(
+            source, out_dir, audio_only=audio_only,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file,
+        )
     return resolve_local(source)
 
 

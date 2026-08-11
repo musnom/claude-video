@@ -134,3 +134,132 @@ def test_english_video_is_unaffected(tmp_path):
     """On an English video the -orig track *is* the English one."""
     d = _touch(tmp_path / "d", "video.en.vtt", "video.en-orig.vtt")
     assert download._pick_subtitle(d).name == "video.en-orig.vtt"
+
+
+def test_read_info_passes_through_the_live_flags(tmp_path):
+    """is_live was unreachable: _read_info narrowed yt-dlp's dict to four keys
+    and dropped it, so nothing downstream could refuse a live URL."""
+    import json as _json
+
+    info_path = tmp_path / "video.info.json"
+    info_path.write_text(_json.dumps({
+        "title": "Live now", "channel": "Someone", "duration": None,
+        "webpage_url": "https://example.com/live",
+        "is_live": True, "live_status": "is_live",
+        "width": 1920, "height": 1080, "vcodec": "avc1",
+        "formats": [{"irrelevant": True}],
+    }), encoding="utf-8")
+
+    info = download._read_info(info_path, "https://example.com/live")
+    assert info["is_live"] is True
+    assert info["live_status"] == "is_live"
+    assert (info["width"], info["height"]) == (1920, 1080)
+    assert info["vcodec"] == "avc1"
+    # ...and still narrows: the raw dict has hundreds of keys.
+    assert set(info) == {
+        "title", "uploader", "duration", "url",
+        "is_live", "live_status", "width", "height", "vcodec",
+    }
+
+
+def test_read_info_on_a_missing_file_is_empty(tmp_path):
+    assert download._read_info(tmp_path / "nope.json", "https://example.com") == {}
+
+
+# --- cookies -------------------------------------------------------------------
+# Opt-in access to login-walled sources. The value reaches yt-dlp's argv, so the
+# only thing standing between a caller and an arbitrary yt-dlp option is the
+# leading-dash check.
+
+
+def test_no_cookie_flags_means_no_cookie_argv():
+    assert download.cookie_args() == []
+    assert download.cookie_args(None, None) == []
+
+
+def test_browser_spec_is_forwarded_verbatim():
+    """yt-dlp validates the browser name and its BROWSER[+KEYRING][:PROFILE]
+    syntax, and reports a better error than a copy of its table would."""
+    assert download.cookie_args("firefox:default") == ["--cookies-from-browser", "firefox:default"]
+    assert download.cookie_args("chrome+gnomekeyring::Work") == [
+        "--cookies-from-browser", "chrome+gnomekeyring::Work",
+    ]
+
+
+@pytest.mark.parametrize("hostile", ["--config-location", "-o/tmp/x", "--exec=rm -rf /"])
+def test_flag_injection_is_rejected_before_yt_dlp_runs(hostile):
+    """Defence in depth, and the code says so.
+
+    Measured against the real binary: yt-dlp's optparse takes the next token as
+    the option's value, so `--cookies-from-browser --config-location URL` fails
+    with "unsupported browser specified" rather than loading a config file. This
+    guard fails earlier and names the flag the caller typed, and it keeps holding
+    if that parsing ever changes — it is not plugging a live hole."""
+    with pytest.raises(SystemExit, match="may not start with"):
+        download.cookie_args(hostile)
+    with pytest.raises(SystemExit, match="may not start with"):
+        download.cookie_args(None, hostile)
+
+
+def test_cookie_file_must_exist(tmp_path):
+    with pytest.raises(SystemExit, match="not found"):
+        download.cookie_args(None, str(tmp_path / "nope.txt"))
+
+
+def test_cookie_file_is_resolved(tmp_path):
+    jar = tmp_path / "cookies.txt"
+    jar.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+    assert download.cookie_args(None, str(jar)) == ["--cookies", str(jar.resolve())]
+
+
+def _capture_ytdlp(monkeypatch) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        calls.append(list(cmd))
+
+        class _Result:
+            returncode = 0
+            stdout = stderr = ""
+
+        return _Result()
+
+    monkeypatch.setattr(download.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(download.subprocess, "run", fake_run)
+    return calls
+
+
+def test_public_download_argv_is_unchanged_without_cookies(monkeypatch, tmp_path):
+    """The no-cookie path must be byte-identical to before this existed."""
+    calls = _capture_ytdlp(monkeypatch)
+    download.fetch_captions("https://example.com/v", tmp_path)
+    argv = calls[0]
+    assert "--cookies-from-browser" not in argv and "--cookies" not in argv
+    assert argv[-2:] == ["--", "https://example.com/v"]
+
+
+def test_cookies_reach_the_caption_pass(monkeypatch, tmp_path):
+    calls = _capture_ytdlp(monkeypatch)
+    download.fetch_captions("https://example.com/v", tmp_path, cookies_from_browser="chrome")
+    argv = calls[0]
+    assert argv[argv.index("--cookies-from-browser") + 1] == "chrome"
+    # Options must precede the "--" terminator or yt-dlp reads them as URLs.
+    assert argv.index("--cookies-from-browser") < argv.index("--")
+    assert argv[-1] == "https://example.com/v"
+
+
+def test_cookies_reach_the_video_download(monkeypatch, tmp_path):
+    calls = _capture_ytdlp(monkeypatch)
+    (tmp_path / "video.mp4").write_bytes(b"x")
+    download.download_url("https://example.com/v", tmp_path, cookies_from_browser="firefox")
+    argv = calls[0]
+    assert argv[argv.index("--cookies-from-browser") + 1] == "firefox"
+    assert argv.index("--cookies-from-browser") < argv.index("--")
+
+
+def test_local_files_ignore_cookie_flags(tmp_path):
+    """A local path never reaches yt-dlp, so nothing should be read."""
+    clip = tmp_path / "v.mp4"
+    clip.write_bytes(b"x")
+    result = download.download(str(clip), tmp_path, cookies_from_browser="chrome")
+    assert result["video_path"] == str(clip.resolve())
