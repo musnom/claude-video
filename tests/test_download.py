@@ -30,20 +30,24 @@ URL = "https://www.youtube.com/watch?v=rlOpbu3Enkw"
 ALLOWED_SUB_LANGS = {".*-orig", "en", "en-US", "en-GB"}
 
 
-def _capture_argv(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    """Stub subprocess.run inside download.py and record every argv."""
+def _capture_argv(
+    monkeypatch: pytest.MonkeyPatch, rc: int = 0, stderr_text: str = ""
+) -> list[list[str]]:
+    """Stub the yt-dlp seam (_stream_ytdlp) and record every argv.
+
+    The seam, not subprocess: download.py runs yt-dlp through _stream_ytdlp
+    (Popen + stderr tee), so a subprocess.run stub would silently stop
+    intercepting. The stale-version check is silenced too, so no test output
+    depends on the machine's installed yt-dlp.
+    """
     calls: list[list[str]] = []
 
-    class _Result:
-        returncode = 0
-        stdout = ""
-        stderr = ""
-
-    def fake_run(cmd, *args, **kwargs):
+    def fake_stream(cmd):
         calls.append(list(cmd))
-        return _Result()
+        return rc, stderr_text
 
-    monkeypatch.setattr(download.subprocess, "run", fake_run)
+    monkeypatch.setattr(download, "_stream_ytdlp", fake_stream)
+    monkeypatch.setattr(download, "_warn_if_stale_ytdlp", lambda: None)
     return calls
 
 
@@ -159,6 +163,7 @@ def test_read_info_passes_through_the_live_flags(tmp_path):
     assert set(info) == {
         "title", "uploader", "duration", "url",
         "is_live", "live_status", "width", "height", "vcodec",
+        "_type", "playlist_count",
     }
 
 
@@ -213,19 +218,8 @@ def test_cookie_file_is_resolved(tmp_path):
 
 
 def _capture_ytdlp(monkeypatch) -> list[list[str]]:
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, *args, **kwargs):
-        calls.append(list(cmd))
-
-        class _Result:
-            returncode = 0
-            stdout = stderr = ""
-
-        return _Result()
-
+    calls = _capture_argv(monkeypatch)
     monkeypatch.setattr(download.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(download.subprocess, "run", fake_run)
     return calls
 
 
@@ -263,3 +257,254 @@ def test_local_files_ignore_cookie_flags(tmp_path):
     clip.write_bytes(b"x")
     result = download.download(str(clip), tmp_path, cookies_from_browser="chrome")
     assert result["video_path"] == str(clip.resolve())
+
+
+# --- YouTube resilience: stale check, 403 retry, classification -----------------
+
+
+import datetime
+import os
+
+
+@pytest.mark.parametrize(
+    "version,expected",
+    [
+        ("2025.08.01", 375),
+        ("2026.8.1", 10),                        # unpadded month/day
+        ("2025.06.30.232815", 407),              # nightly suffix
+        ("2025.06.30.dev0", 407),                # dev builds still lead with the date
+        ("unknown", None),
+        ("", None),
+        ("10.2", None),
+        ("2025.13.45", None),                    # not a real date -> never warn
+    ],
+)
+def test_ytdlp_age_parses_calver(version, expected):
+    today = datetime.date(2026, 8, 11)
+    assert download._ytdlp_age_days(version, today) == expected
+
+
+def test_stale_threshold_is_a_named_constant():
+    assert download.YTDLP_STALE_DAYS == 90
+
+
+def test_download_url_carries_the_live_filter_and_playlist_bound(monkeypatch, tmp_path):
+    calls = _capture_ytdlp(monkeypatch)
+    (tmp_path / "video.mp4").write_bytes(b"x")
+    download.download_url(URL, tmp_path)
+    argv = calls[0]
+    assert argv[argv.index("--match-filter") + 1] == "!is_live"
+    assert argv[argv.index("--playlist-items") + 1] == "1"
+    assert argv[-2:] == ["--", URL]
+
+
+def test_fetch_captions_bounds_playlists_but_keeps_no_filter(monkeypatch, tmp_path):
+    """The caption pass is already bounded (--skip-download) and must not lose
+    metadata for a live URL — the pre-download guard reads it."""
+    calls = _capture_ytdlp(monkeypatch)
+    download.fetch_captions(URL, tmp_path)
+    argv = calls[0]
+    assert argv[argv.index("--playlist-items") + 1] == "1"
+    assert "--match-filter" not in argv
+
+
+def test_403_triggers_exactly_one_android_retry(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_stream(cmd):
+        calls.append(list(cmd))
+        if len(calls) == 2:
+            (tmp_path / "video.mp4").write_bytes(b"x")
+        return 1, "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+
+    monkeypatch.setattr(download, "_stream_ytdlp", fake_stream)
+    monkeypatch.setattr(download, "_warn_if_stale_ytdlp", lambda: None)
+    result = download.download_url(URL, tmp_path)
+    assert result["video_path"].endswith("video.mp4")
+    assert len(calls) == 2
+    retry = calls[1]
+    idx = retry.index("--extractor-args")
+    assert retry[idx + 1] == "youtube:player_client=android"
+    assert idx < retry.index("--"), "extractor-args must precede the terminator"
+
+
+def test_no_retry_when_the_file_landed_despite_nonzero_exit(monkeypatch, tmp_path):
+    """A subtitle 429 exits non-zero with the media present — the docstring
+    contract 'video file present is success' must survive the retry logic."""
+    calls = _capture_argv(monkeypatch, rc=1, stderr_text="HTTP Error 403 on a subtitle")
+    monkeypatch.setattr(download.shutil, "which", lambda name: f"/usr/bin/{name}")
+    (tmp_path / "video.mp4").write_bytes(b"x")
+    result = download.download_url(URL, tmp_path)
+    assert result["downloaded"] is True
+    assert len(calls) == 1
+
+
+def test_non_403_failure_does_not_retry(monkeypatch, tmp_path):
+    calls = _capture_argv(monkeypatch, rc=1, stderr_text="ERROR: This video is unavailable")
+    monkeypatch.setattr(download.shutil, "which", lambda name: f"/usr/bin/{name}")
+    with pytest.raises(SystemExit):
+        download.download_url(URL, tmp_path)
+    assert len(calls) == 1
+
+
+def test_fetch_captions_never_retries(monkeypatch, tmp_path):
+    calls = _capture_argv(monkeypatch, rc=1, stderr_text="HTTP Error 403: Forbidden")
+    monkeypatch.setattr(download.shutil, "which", lambda name: f"/usr/bin/{name}")
+    result = download.fetch_captions(URL, tmp_path)
+    assert len(calls) == 1
+    assert result["fetch_failed"] is True
+
+
+def test_fetch_failed_is_false_when_info_survived(monkeypatch, tmp_path):
+    """rc != 0 with info.json present is a subtitle-only failure; the live and
+    playlist guards can still evaluate and must not be reported blind."""
+    import json as _json
+
+    calls = _capture_argv(monkeypatch, rc=1, stderr_text="429 on a subtitle track")
+    monkeypatch.setattr(download.shutil, "which", lambda name: f"/usr/bin/{name}")
+    (tmp_path / "video.info.json").write_text(
+        _json.dumps({"title": "T", "webpage_url": URL}), encoding="utf-8"
+    )
+    result = download.fetch_captions(URL, tmp_path)
+    assert result["fetch_failed"] is False
+    assert calls
+
+
+@pytest.mark.parametrize(
+    "stderr_text,fragment",
+    [
+        ("ERROR: Sign in to confirm you're not a bot", "--cookies-from-browser"),
+        ("ERROR: This video is age-restricted", "--cookies-from-browser"),
+        ("ERROR: Private video. Sign in if you", "--cookies-from-browser"),
+        ("ERROR: The uploader has not made this video available in your country", "region-locked"),
+        ("live thing does not pass filter (!is_live), skipping", "live broadcast"),
+        ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "SABR-style"),
+        ("something else entirely went wrong", "did not produce a video file"),
+    ],
+)
+def test_failure_classification_routes_remediation(monkeypatch, stderr_text, fragment, tmp_path):
+    monkeypatch.setattr(download, "_ytdlp_version", lambda: "2026.01.01")
+    message = download._classify_download_failure(stderr_text, 1, tmp_path, retried_android=True)
+    assert fragment in message, message
+
+
+def test_403_classification_names_the_retry_and_the_version(monkeypatch, tmp_path):
+    monkeypatch.setattr(download, "_ytdlp_version", lambda: "2025.01.15")
+    message = download._classify_download_failure(
+        "HTTP Error 403: Forbidden", 1, tmp_path, retried_android=True
+    )
+    assert "Android player client was already attempted" in message
+    assert "2025.01.15" in message
+    assert "days old" in message
+
+
+# --- playlist refusal -----------------------------------------------------------
+
+
+def test_playlist_url_is_refused():
+    with pytest.raises(SystemExit, match="playlist or channel"):
+        download.refuse_if_playlist({"playlist_count": 47})
+    with pytest.raises(SystemExit, match="playlist or channel"):
+        download.refuse_if_playlist({"_type": "playlist"})
+
+
+def test_single_video_and_empty_info_pass():
+    download.refuse_if_playlist({})
+    download.refuse_if_playlist({"playlist_count": None})
+    download.refuse_if_playlist({"playlist_count": 1})  # its one video IS the request
+    download.refuse_if_playlist({"title": "ordinary video"})
+
+
+def test_read_info_passes_through_playlist_markers(tmp_path):
+    import json as _json
+
+    info_path = tmp_path / "video.info.json"
+    info_path.write_text(_json.dumps({
+        "title": "Entry 1", "webpage_url": "https://example.com/watch?v=a",
+        "playlist_count": 47,
+    }), encoding="utf-8")
+    info = download._read_info(info_path, "https://example.com/playlist?list=x")
+    assert info["playlist_count"] == 47
+
+
+# --- --sub-langs override -------------------------------------------------------
+
+
+def test_sub_langs_override_reaches_both_call_sites(monkeypatch, tmp_path):
+    calls = _capture_ytdlp(monkeypatch)
+    download.fetch_captions(URL, tmp_path / "a", sub_langs="en-CA")
+    b = tmp_path / "b"
+    b.mkdir()
+    (b / "video.mp4").write_bytes(b"x")
+    download.download_url(URL, b, sub_langs="en-CA")
+    assert _sub_langs(calls[0]) == _sub_langs(calls[1]) == "en-CA"
+
+
+def test_default_sub_langs_are_unchanged(monkeypatch, tmp_path):
+    """The measured-better-than-upstream default is the pin; overrides are the
+    user's choice and deliberately unpinned."""
+    calls = _capture_ytdlp(monkeypatch)
+    download.fetch_captions(URL, tmp_path)
+    assert _sub_langs(calls[0]) == download.SUB_LANGS == ".*-orig,en,en-US,en-GB"
+
+
+def test_requested_variant_is_selected_not_just_fetched(tmp_path):
+    """The gaps.md 'Rejected' edge, closed properly: en-CA both fetched AND
+    picked over an unrelated track."""
+    d = _touch(tmp_path / "d", "video.en-CA.vtt", "video.fr.vtt")
+    assert download._pick_subtitle(d, ".*-orig,en-CA").name == "video.en-CA.vtt"
+    # ...and the default still prefers plain English variants in request order.
+    d2 = _touch(tmp_path / "d2", "video.en.vtt", "video.en-GB.vtt")
+    assert download._pick_subtitle(d2).name == "video.en.vtt"
+
+
+# --- the seam itself, through a real subprocess ----------------------------------
+
+
+def _fake_ytdlp_on_path(monkeypatch, tmp_path: Path, body: str) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "yt-dlp"
+    script.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+
+
+def test_stream_ytdlp_forwards_and_captures_stderr(monkeypatch, tmp_path, capfd):
+    """The tee is the crux of the resilience work: stderr must reach the user
+    live AND come back for classification. capfd, not capsys — stdout is passed
+    through at fd level."""
+    _fake_ytdlp_on_path(
+        monkeypatch, tmp_path,
+        'echo "progress line" ; echo "MARKER-ON-STDERR" >&2 ; exit 3',
+    )
+    rc, captured = download._stream_ytdlp(["yt-dlp", "--fake"])
+    assert rc == 3
+    assert "MARKER-ON-STDERR" in captured
+    assert "MARKER-ON-STDERR" in capfd.readouterr().err
+
+
+def test_android_retry_end_to_end_through_a_real_subprocess(monkeypatch, tmp_path, capfd):
+    """Fail-with-403 then succeed, through the real Popen/tee machinery —
+    including surviving a partial .part file from the first attempt."""
+    state = tmp_path / "state"
+    out_dir = tmp_path / "dl"
+    out_dir.mkdir()
+    body = f'''
+if [ ! -f "{state}" ]; then
+  touch "{state}"
+  touch "{out_dir}/video.mp4.part"
+  echo "ERROR: unable to download video data: HTTP Error 403: Forbidden" >&2
+  exit 1
+fi
+case "$*" in *player_client=android*) : ;; *) echo "retry missing android client: $*" >&2 ; exit 7 ;; esac
+touch "{out_dir}/video.mp4"
+exit 0
+'''
+    _fake_ytdlp_on_path(monkeypatch, tmp_path, body)
+    monkeypatch.setattr(download, "_warn_if_stale_ytdlp", lambda: None)
+    result = download.download_url("https://example.com/v", out_dir)
+    assert result["video_path"].endswith("video.mp4")
+    err = capfd.readouterr().err
+    assert "retrying once with the Android player client" in err
+    assert "HTTP Error 403" in err, "the tee did not forward the child's stderr"

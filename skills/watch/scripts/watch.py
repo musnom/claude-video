@@ -16,17 +16,17 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from config import ensure_utf8_console, frame_cap, get_config  # noqa: E402
+from config import ensure_utf8_console, frame_cap, get_config, read_setting  # noqa: E402
 
 # Before the sibling imports below, so a failure raised during them also prints
 # safely. The report contains U+2192 and an em dash, and video titles routinely
 # carry emoji or CJK — all fatal on a piped Windows console otherwise, after
 # the download and every frame extraction have already succeeded.
 ensure_utf8_console()
-from download import download, fetch_captions, is_url  # noqa: E402
+from download import download, fetch_captions, is_url, refuse_if_playlist  # noqa: E402
 from frames import MAX_FPS, MOTION_HARD_MAX, MOTION_TOKEN_CEILING, MOTION_TOKEN_HARD_CEILING, SCENE_THRESHOLD, frame_dimensions, measure_motion, motion_envelope, motion_token_estimate, parse_crop, validate_crop, auto_fps, auto_fps_focus, extract_at_timestamps, extract_motion, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
-from whisper import load_api_key, transcribe_video  # noqa: E402
+from whisper import LongAudioRefusal, load_api_key, transcribe_video  # noqa: E402
 
 
 # Every frame kind now carries a sub-second label. Whole seconds were kept for
@@ -259,6 +259,23 @@ def main() -> int:
              "--cookies-from-browser when you have exported cookies already.",
     )
     ap.add_argument(
+        "--sub-langs",
+        type=str,
+        default=None,
+        metavar="LIST",
+        help="Comma-separated yt-dlp caption-language patterns (also settable as "
+             "WATCH_SUB_LANGS). Use when the video's only track is a regional "
+             "variant (en-CA) or a non-English language with no -orig track. Broad "
+             "regexes fan out across YouTube's dozens of auto-translated tracks and "
+             "collect rate-limit rejections — prefer exact codes.",
+    )
+    ap.add_argument(
+        "--transcribe-anyway",
+        action="store_true",
+        help="Proceed with a cloud Whisper upload past the ~60-minute duration "
+             "guard. Ask the user before passing this — it is their API bill.",
+    )
+    ap.add_argument(
         "--scene-threshold",
         type=float,
         default=None,
@@ -305,12 +322,15 @@ def main() -> int:
     transcript_source: str | None = None
     video_path: str | None = None
 
+    sub_langs = args.sub_langs or read_setting("WATCH_SUB_LANGS") or None
+
     if url_source:
         print("[watch] checking metadata/captions via yt-dlp…", file=sys.stderr)
         dl = fetch_captions(
             args.source, work / "download",
             cookies_from_browser=args.cookies_from_browser,
             cookies_file=args.cookies,
+            sub_langs=sub_langs,
         )
         if dl.get("subtitle_path"):
             try:
@@ -320,8 +340,21 @@ def main() -> int:
             except Exception as exc:
                 print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
                 transcript_segments = []
+        if dl.get("fetch_failed"):
+            # Say when the guards below cannot see. The download itself still
+            # carries a --match-filter '!is_live' belt, so a live URL fails in
+            # seconds with the same message instead of recording forever.
+            print(
+                f"[watch] metadata fetch failed (yt-dlp exit "
+                f"{dl.get('fetch_returncode')}) — cannot verify this URL is not "
+                "a live stream or playlist before downloading; if it is live, "
+                "yt-dlp will refuse it at download time instead of recording "
+                "forever.",
+                file=sys.stderr,
+            )
 
     refuse_if_live(dl.get("info") or {})
+    refuse_if_playlist(dl.get("info") or {})
 
     # --timestamps and --motion both need the video for frame grabs, so either
     # overrides the transcript-mode download skip (and forces a full, not
@@ -345,6 +378,7 @@ def main() -> int:
                 audio_only=audio_only,
                 cookies_from_browser=args.cookies_from_browser,
                 cookies_file=args.cookies,
+                sub_langs=sub_langs,
             )
         else:
             print("[watch] using local file…", file=sys.stderr)
@@ -671,6 +705,7 @@ def main() -> int:
         except Exception as exc:
             print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
 
+    transcription_refused_long = False
     if not transcript_segments and not args.no_whisper and video_path and meta.get("has_audio"):
         backend, api_key = load_api_key(args.whisper)
         # A self-hosted endpoint has no key, so `custom` is enough on its own.
@@ -686,10 +721,18 @@ def main() -> int:
                     # filter_range below selects on.
                     start_seconds=start_sec,
                     end_seconds=end_sec,
+                    allow_long=args.transcribe_anyway,
                 )
                 transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
                 transcript_text = format_transcript(transcript_segments)
                 transcript_source = f"whisper ({used_backend})"
+            except LongAudioRefusal as exc:
+                # Remembered so the report states the real reason — the generic
+                # "no API key set" text would be false here. The message names
+                # --transcribe-anyway; SKILL.md tells the model to relay the
+                # estimate via AskUserQuestion and re-run on a yes.
+                transcription_refused_long = True
+                print(f"[watch] {exc}", file=sys.stderr)
             except SystemExit as exc:
                 print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
         else:
@@ -1005,6 +1048,16 @@ def main() -> int:
             "_No transcript available at transcript detail. Captions were missing and Whisper was "
             "unavailable or failed, so there is no visual fallback here. Re-run with "
             "`--detail balanced` for frames._"
+        )
+    elif transcription_refused_long:
+        # The generic "no API key" text below would be false here — a key
+        # exists; the run was refused by the duration guard, and the honest
+        # report is the path to the override.
+        print(
+            "_No transcript: skipped by the Whisper duration guard — this source "
+            "exceeds ~60 minutes of audio, which is a real API bill. Ask the user, "
+            "then re-run with `--transcribe-anyway` to transcribe it all, or with "
+            "`--start`/`--end` to transcribe a section._"
         )
     elif focused and dl.get("subtitle_path"):
         print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")

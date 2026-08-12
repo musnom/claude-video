@@ -6,7 +6,11 @@ transcribe.py can parse them without needing Whisper.
 """
 from __future__ import annotations
 
+import datetime
+import functools
 import json
+import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +19,18 @@ from urllib.parse import urlparse
 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
+
+# Stderr substrings that identify YouTube's 403 / SABR-style blocking. Case-
+# insensitive; pinned as a constant so the retry and the classifier agree.
+_SIG_403 = ("http error 403", "403: forbidden", "sabr")
+
+# yt-dlp versions are CalVer (YYYY.MM.DD), so staleness is readable off the
+# version string with no network call. 90 days: yt-dlp ships every 2-6 weeks
+# and YouTube extractor breakage has consistently been fixed within days of a
+# site change, so an install >3 months old predates at least one breaking
+# change with near-certainty. 30 would nag most Homebrew users (brew lags
+# weeks); 180 misses the window in which the SABR-era breakage landed.
+YTDLP_STALE_DAYS = 90
 
 # Caption tracks to request, as a single yt-dlp --sub-langs value shared by both
 # call sites (they must stay in step; _pick_subtitle below can only choose from
@@ -89,6 +105,192 @@ def is_url(source: str) -> bool:
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
+def _forward_stderr_bytes(chunk: bytes) -> None:
+    """Write a child's stderr chunk to ours, never letting the echo raise.
+
+    Bytes-level via the buffer when available: ensure_utf8_console may have
+    reconfigured the text stream, and yt-dlp's stderr can carry bytes that are
+    not valid UTF-8.
+    """
+    try:
+        buffer = getattr(sys.stderr, "buffer", None)
+        if buffer is not None:
+            buffer.write(chunk)
+            buffer.flush()
+        else:
+            sys.stderr.write(chunk.decode("utf-8", errors="replace"))
+            sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _stream_ytdlp(cmd: list[str]) -> tuple[int, str]:
+    """Run yt-dlp, streaming its output live while capturing stderr.
+
+    The old call sites did ``subprocess.run(cmd, stdout=sys.stderr,
+    stderr=sys.stderr)`` — both streams inherited our fd, so nothing was
+    capturable and every failure collapsed into "no video file (exit N)" with
+    no way to tell a login wall from a region lock from SABR.
+
+    yt-dlp writes download *progress* to stdout and errors to stderr, so only
+    the low-volume stream needs a pipe: stdout keeps going straight to our
+    stderr fd (live progress, no parent-side pumping), while stderr is teed —
+    forwarded chunk-by-chunk AND buffered for classification. One pipe, no
+    thread, no deadlock. ``read1`` rather than ``readline`` so ``\\r``-terminated
+    retry lines forward promptly.
+    """
+    try:
+        sys.stderr.fileno()
+        stdout_target = sys.stderr
+    except Exception:
+        # No real fd behind stderr (embedded/captured stream): lose the
+        # progress display, keep working.
+        stdout_target = subprocess.DEVNULL
+    proc = subprocess.Popen(cmd, stdout=stdout_target, stderr=subprocess.PIPE)
+    chunks: list[bytes] = []
+    assert proc.stderr is not None
+    while True:
+        chunk = proc.stderr.read1(4096)
+        if not chunk:
+            break
+        _forward_stderr_bytes(chunk)
+        chunks.append(chunk)
+    proc.wait()
+    return proc.returncode, b"".join(chunks).decode("utf-8", errors="replace")
+
+
+@functools.lru_cache(maxsize=None)
+def _ytdlp_version() -> str:
+    """The installed yt-dlp's version string, or "" when unavailable."""
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--version"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _ytdlp_age_days(version: str, today: datetime.date) -> int | None:
+    """Days since the release the version string names; None if unparseable.
+
+    Accepts stable ``2025.06.30`` and nightly ``2025.06.30.232815`` forms.
+    Unparseable never warns — a guess would nag users of forks and dev builds.
+    """
+    match = re.match(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})", version)
+    if not match:
+        return None
+    try:
+        released = datetime.date(*(int(g) for g in match.groups()))
+    except ValueError:
+        return None
+    return (today - released).days
+
+
+def _upgrade_hint() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        return "brew upgrade yt-dlp"
+    if system == "Windows":
+        return "winget upgrade yt-dlp.yt-dlp (or: pip install -U yt-dlp)"
+    return "pipx upgrade yt-dlp (or: pip install -U yt-dlp)"
+
+
+_STALE_WARNED = False
+
+
+def _warn_if_stale_ytdlp() -> None:
+    """One stderr line when the installed yt-dlp predates the current extractor
+    generation — the single most common cause of YouTube 403/format failures."""
+    global _STALE_WARNED
+    if _STALE_WARNED:
+        return
+    version = _ytdlp_version()
+    age = _ytdlp_age_days(version, datetime.date.today())
+    if age is not None and age > YTDLP_STALE_DAYS:
+        _STALE_WARNED = True
+        print(
+            f"[watch] warning: yt-dlp {version} is {age} days old. YouTube "
+            "403/format failures are most often a stale yt-dlp. Upgrade: "
+            f"{_upgrade_hint()}",
+            file=sys.stderr,
+        )
+
+
+def _matches_403(stderr_text: str) -> bool:
+    low = stderr_text.lower()
+    return any(sig in low for sig in _SIG_403)
+
+
+_LOGIN_SIGS = (
+    "sign in to confirm", "age-restricted", "age restricted", "private video",
+    "members-only", "members only", "login required", "join this channel",
+    "cookies", "confirm your age",
+)
+_REGION_SIGS = (
+    "not available in your country", "geo restrict",
+    "not made this video available", "blocked it in your country",
+)
+
+
+def _classify_download_failure(
+    stderr_text: str, returncode: int, out_dir: Path, retried_android: bool
+) -> str:
+    """Turn yt-dlp's stderr into a message that routes to the right remediation.
+
+    The old message — "no video file (exit N)" — could not distinguish a login
+    wall (fix: cookies, with the user's consent) from a region lock (cookies
+    will not help) from SABR blocking (fix: upgrade yt-dlp / android client),
+    so the model reading it could not follow SKILL.md's failure table.
+    First match wins; the login check runs first because YouTube's age-gate
+    messages often also mention 403.
+    """
+    low = stderr_text.lower()
+    if any(sig in low for sig in _LOGIN_SIGS):
+        return (
+            "Download failed: this video appears to be login-walled, age-gated or "
+            "members-only.\nRe-run with --cookies-from-browser <browser> (e.g. "
+            "chrome, firefox) so yt-dlp can authenticate as you — ask the user "
+            "before reading their browser's cookies."
+        )
+    if any(sig in low for sig in _REGION_SIGS):
+        return (
+            "Download failed: this video is region-locked. Cookies will not "
+            "help — it needs a different source or region."
+        )
+    if "does not pass filter" in low and "is_live" in low:
+        # The --match-filter guard fired: same message the pre-download check
+        # prints when the metadata fetch succeeds.
+        return (
+            "This URL is a live broadcast. yt-dlp would record it until it ends, "
+            "which for an ongoing stream means /watch never returns.\n"
+            "Re-run once the stream has finished — the same URL then resolves to "
+            "a normal recording."
+        )
+    if _matches_403(stderr_text):
+        version = _ytdlp_version()
+        age = _ytdlp_age_days(version, datetime.date.today())
+        age_note = f" ({age} days old)" if age is not None else ""
+        retry_note = (
+            "A retry with the Android player client was already attempted and "
+            "also failed. "
+            if retried_android else ""
+        )
+        return (
+            "Download failed with HTTP 403 (SABR-style blocking). "
+            f"{retry_note}Installed yt-dlp: {version or 'unknown'}{age_note} — "
+            "an outdated yt-dlp is the most common cause. Upgrade with "
+            f"`{_upgrade_hint()}` and re-run."
+        )
+    tail = stderr_text.strip()[-400:]
+    message = f"yt-dlp did not produce a video file in {out_dir} (exit {returncode})."
+    if tail:
+        message += f"\nLast yt-dlp output:\n{tail}"
+    return message
+
+
 def resolve_local(path: str) -> dict:
     p = Path(path).expanduser().resolve()
     if not p.exists():
@@ -106,13 +308,18 @@ def resolve_local(path: str) -> dict:
     }
 
 
-def _pick_subtitle(out_dir: Path) -> Path | None:
+def _pick_subtitle(out_dir: Path, sub_langs: str = SUB_LANGS) -> Path | None:
     """Choose the best downloaded caption track.
 
-    The source-language track wins over English: on a non-English video the
-    English file is a machine translation of the ASR, so preferring it loses
-    fidelity for nothing. On an English video the -orig track *is* the English
-    one, so this ordering costs nothing there.
+    The source-language track wins over anything requested: on a non-English
+    video the English file is a machine translation of the ASR, so preferring
+    it loses fidelity for nothing. On an English video the -orig track *is* the
+    English one, so this ordering costs nothing there.
+
+    After that, preference follows the literal (non-regex) tokens of the
+    effective ``--sub-langs`` value, in the order they were requested — so a
+    user who asked for ``en-CA`` gets the en-CA track *selected*, not merely
+    fetched and then passed over for a hardcoded English list.
     """
     candidates = sorted(out_dir.glob("video*.vtt"))
     if not candidates:
@@ -120,11 +327,14 @@ def _pick_subtitle(out_dir: Path) -> Path | None:
     original = [c for c in candidates if "-orig." in c.name]
     if original:
         return original[0]
-    english = [
-        c for c in candidates
-        if any(marker in c.name for marker in (".en.", ".en-US.", ".en-GB."))
-    ]
-    return english[0] if english else candidates[0]
+    for token in (t.strip() for t in sub_langs.split(",")):
+        if not token or any(ch in token for ch in ".*[]()?+\\^$"):
+            continue  # regex patterns cannot become filename markers
+        marker = f".{token}."
+        for candidate in candidates:
+            if marker in candidate.name:
+                return candidate
+    return candidates[0]
 
 
 def _pick_video(out_dir: Path) -> Path | None:
@@ -142,6 +352,7 @@ def fetch_captions(
     out_dir: Path,
     cookies_from_browser: str | None = None,
     cookies_file: str | None = None,
+    sub_langs: str | None = None,
 ) -> dict:
     """Fetch metadata and best available VTT captions without downloading video."""
     if shutil.which("yt-dlp") is None:
@@ -149,16 +360,23 @@ def fetch_captions(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
+    effective_langs = sub_langs or SUB_LANGS
     cmd = [
         "yt-dlp",
         "--skip-download",
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", SUB_LANGS,
+        "--sub-langs", effective_langs,
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
+        # Bounds the pass when the URL is a bare playlist/channel: without it a
+        # 300-entry playlist fires 300 metadata+caption fetches (all colliding
+        # on video.%(ext)s) before any guard can read the info JSON. With it,
+        # one entry is processed and its info carries playlist_count for the
+        # caller's refusal. Ignored for ordinary single-video URLs.
+        "--playlist-items", "1",
         "--ignore-errors",
         "-o", output_template,
     ]
@@ -166,14 +384,19 @@ def fetch_captions(
     # only positional argument.
     cmd += cookie_args(cookies_from_browser, cookies_file)
     cmd += ["--", url]
-    subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
-    subtitle = _pick_subtitle(out_dir)
+    returncode, _stderr_text = _stream_ytdlp(cmd)
+    subtitle = _pick_subtitle(out_dir, effective_langs)
     info = _read_info(out_dir / "video.info.json", url)
     return {
         "video_path": None,
         "subtitle_path": str(subtitle) if subtitle else None,
         "info": info or {"url": url},
         "downloaded": False,
+        # A nonzero exit WITH info present is a subtitle-only failure (e.g. a
+        # 429 on one track) — the live/playlist guards can still evaluate. Only
+        # a failed metadata fetch blinds them, and the caller warns then.
+        "fetch_failed": returncode != 0 and not info,
+        "fetch_returncode": returncode,
     }
 
 
@@ -204,6 +427,13 @@ def _read_info(info_path: Path, url: str) -> dict:
                 "width": raw.get("width"),
                 "height": raw.get("height"),
                 "vcodec": raw.get("vcodec"),
+                # Playlist markers, free in the same JSON: `_type` when only
+                # the playlist metafile got written, and the entry counts that
+                # yt-dlp injects into every entry extracted via a playlist.
+                # Without them a /playlist?list=… URL downloads an arbitrary
+                # entry and the report describes it as though it were the URL.
+                "_type": raw.get("_type"),
+                "playlist_count": raw.get("playlist_count") or raw.get("n_entries"),
             }
         except Exception as exc:
             print(f"[watch] info.json parse failed: {exc}", file=sys.stderr)
@@ -217,12 +447,14 @@ def download_url(
     audio_only: bool = False,
     cookies_from_browser: str | None = None,
     cookies_file: str | None = None,
+    sub_langs: str | None = None,
 ) -> dict:
     if shutil.which("yt-dlp") is None:
         raise SystemExit("yt-dlp is not installed. Install with: brew install yt-dlp")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(out_dir / "video.%(ext)s")
+    effective_langs = sub_langs or SUB_LANGS
 
     fmt = "ba/bestaudio" if audio_only else "bv*[height<=720]+ba/b[height<=720]/bv+ba/b"
     cmd = [
@@ -233,26 +465,56 @@ def download_url(
         "--write-info-json",
         "--write-subs",
         "--write-auto-subs",
-        "--sub-langs", SUB_LANGS,
+        "--sub-langs", effective_langs,
         "--sub-format", "vtt",
         "--convert-subs", "vtt",
         "--no-playlist",
+        "--playlist-items", "1",
+        # Refuses a currently-live stream at download time. The pre-download
+        # guard (watch.refuse_if_live) is blind exactly when the metadata fetch
+        # failed — i.e. when yt-dlp is struggling — and a live URL then means
+        # recording until the broadcast ends. `!is_live` passes when the field
+        # is False or missing (non-YouTube extractors unaffected) and rejects
+        # only an ongoing broadcast; post-live VODs pass, matching the guard's
+        # deliberate post_live allowance. A rejected entry produces no file and
+        # the classifier maps the filter message to the same live-broadcast
+        # text the guard prints.
+        "--match-filter", "!is_live",
         "--ignore-errors",
         "-o", output_template,
     ]
     cmd += cookie_args(cookies_from_browser, cookies_file)
     cmd += ["--", url]
 
+    _warn_if_stale_ytdlp()
+
     # yt-dlp may exit non-zero if a subtitle variant fails (e.g. 429) even when
-    # the video itself downloaded fine. Treat "video file present" as success.
-    result = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
+    # the video itself downloaded fine. Treat "video file present" as success —
+    # which is also why the 403 retry below keys on the missing file, not on
+    # the exit code.
+    returncode, stderr_text = _stream_ytdlp(cmd)
     video = _pick_video(out_dir)
+    retried_android = False
+    if video is None and _matches_403(stderr_text):
+        # Exactly one retry, media only: the android player client is the one
+        # reported to survive SABR blocking, but it also kills captions — and
+        # captions were already fetched by fetch_captions before this runs.
+        print(
+            "[watch] media download hit HTTP 403 — retrying once with the "
+            "Android player client…",
+            file=sys.stderr,
+        )
+        retry_cmd = cmd[:-2] + ["--extractor-args", "youtube:player_client=android"] + cmd[-2:]
+        returncode, retry_stderr = _stream_ytdlp(retry_cmd)
+        stderr_text = f"{stderr_text}\n{retry_stderr}"
+        video = _pick_video(out_dir)
+        retried_android = True
     if video is None:
         raise SystemExit(
-            f"yt-dlp did not produce a video file in {out_dir} (exit {result.returncode})"
+            _classify_download_failure(stderr_text, returncode, out_dir, retried_android)
         )
 
-    subtitle = _pick_subtitle(out_dir)
+    subtitle = _pick_subtitle(out_dir, effective_langs)
     info = _read_info(out_dir / "video.info.json", url)
 
     return {
@@ -263,18 +525,43 @@ def download_url(
     }
 
 
+def refuse_if_playlist(info: dict) -> None:
+    """Stop when the URL names a playlist or channel rather than one video.
+
+    Without this every entry downloads over the same ``video.%(ext)s`` template
+    and the report describes an arbitrary entry as though it were the source.
+    ``--playlist-items 1`` (both call sites) bounds the damage to one entry;
+    this turns that entry into a refusal with the actual fix.
+
+    Tolerates ``{}`` (a failed metadata fetch is a normal outcome) and lets a
+    single-entry playlist through — its one video IS the request.
+    """
+    count = info.get("playlist_count")
+    if info.get("_type") == "playlist" or (count or 0) > 1:
+        noun = f"{count} videos" if count else "multiple videos"
+        raise SystemExit(
+            f"This URL is a playlist or channel ({noun}), not a single video. "
+            "/watch reads one video at a time — every entry would be written "
+            "over the same output file and the report would describe an "
+            "arbitrary entry as though it were the whole source.\n"
+            "Pass the URL of one specific video from it and re-run."
+        )
+
+
 def download(
     source: str,
     out_dir: Path,
     audio_only: bool = False,
     cookies_from_browser: str | None = None,
     cookies_file: str | None = None,
+    sub_langs: str | None = None,
 ) -> dict:
     if is_url(source):
         return download_url(
             source, out_dir, audio_only=audio_only,
             cookies_from_browser=cookies_from_browser,
             cookies_file=cookies_file,
+            sub_langs=sub_langs,
         )
     return resolve_local(source)
 

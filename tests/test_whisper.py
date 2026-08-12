@@ -318,3 +318,158 @@ def test_a_window_inside_the_audio_is_accepted(tmp_path):
         str(source), tmp_path / "ok.mp3", start_seconds=1.0, end_seconds=2.0,
     )
     assert whisper.audio_duration(out) == pytest.approx(1.0, abs=0.3)
+
+
+# --- Retry-After is honored only up to a ceiling --------------------------------
+# Per-minute rate limits send seconds; daily-quota exhaustion sends HOURS, and
+# sleeping through one meant /watch printed a single line and then blocked the
+# whole session. Past the ceiling the caller gets the server's number and
+# decides — a sleeping process cannot.
+
+
+def _http_429(retry_after: str | None):
+    import io as _io
+    import urllib.error
+
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    return urllib.error.HTTPError(
+        "https://api.example/v1", 429, "Too Many Requests", headers, _io.BytesIO(b"")
+    )
+
+
+def _post_with(monkeypatch, tmp_path, exc_sequence):
+    """Drive _post_whisper against a scripted sequence of urlopen outcomes."""
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"mp3")
+    calls = {"n": 0}
+    sleeps: list[float] = []
+
+    class _OK:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"segments": [], "text": "hi"}'
+
+    def fake_urlopen(request, *a, **k):
+        outcome = exc_sequence[min(calls["n"], len(exc_sequence) - 1)]
+        calls["n"] += 1
+        if outcome is None:
+            return _OK()
+        raise outcome
+
+    monkeypatch.setattr(whisper, "urlopen", fake_urlopen)
+    monkeypatch.setattr(whisper.time, "sleep", lambda s: sleeps.append(s))
+    result = whisper._post_whisper("https://api.example/v1", "key", "model", audio)
+    return result, sleeps
+
+
+def test_huge_retry_after_fails_fast_instead_of_sleeping(monkeypatch, tmp_path):
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"mp3")
+    sleeps: list[float] = []
+    monkeypatch.setattr(whisper, "urlopen", lambda *a, **k: (_ for _ in ()).throw(_http_429("7200")))
+    monkeypatch.setattr(whisper.time, "sleep", lambda s: sleeps.append(s))
+    with pytest.raises(SystemExit) as exc:
+        whisper._post_whisper("https://api.example/v1", "key", "model", audio)
+    message = str(exc.value)
+    assert "7200" in message
+    assert "ceiling" in message
+    assert "quota" in message
+    assert sleeps == [], "must fail fast, not sleep through a quota window"
+
+
+def test_small_retry_after_is_still_honored(monkeypatch, tmp_path):
+    result, sleeps = _post_with(monkeypatch, tmp_path, [_http_429("30"), None])
+    assert sleeps == [30.0]
+    assert result["text"] == "hi"
+
+
+def test_missing_retry_after_keeps_the_backoff_formula(monkeypatch, tmp_path):
+    result, sleeps = _post_with(monkeypatch, tmp_path, [_http_429(None), None])
+    # RETRY_BASE_DELAY * 2**0 + 1 for the first 429 with no header.
+    assert sleeps == [whisper.RETRY_BASE_DELAY + 1]
+    assert result["text"] == "hi"
+
+
+def test_non_numeric_retry_after_parses_to_none():
+    assert whisper._retry_after(_http_429("sixty")) is None
+
+
+# --- cloud duration guard --------------------------------------------------------
+# A captionless 4-hour video used to upload ~4 hours of audio with no estimate
+# and no confirmation. The guard refuses BEFORE the encode with the estimate and
+# the exact override flag; --motion set the house precedent that expensive runs
+# block rather than warn.
+
+
+def _stub_transcription(monkeypatch, tmp_path, source_seconds: float):
+    monkeypatch.setattr(whisper, "audio_duration", lambda p: source_seconds)
+    audio = tmp_path / "a.mp3"
+
+    def fake_extract(video_path, out_path, start_seconds=None, end_seconds=None):
+        audio.write_bytes(b"x" * 100)
+        return audio
+
+    monkeypatch.setattr(whisper, "extract_audio", fake_extract)
+    monkeypatch.setattr(
+        whisper, "_transcribe_file",
+        lambda backend, key, path: [{"start": 0.0, "end": 1.0, "text": "hi"}],
+    )
+
+
+def test_long_audio_is_refused_with_the_override_flag_named(monkeypatch, tmp_path):
+    _stub_transcription(monkeypatch, tmp_path, 2 * 3600.0)
+    with pytest.raises(whisper.LongAudioRefusal) as exc:
+        whisper.transcribe_video("v.mp4", tmp_path / "a.mp3", backend="groq", api_key="k")
+    message = str(exc.value)
+    assert "120 minutes" in message
+    assert "--transcribe-anyway" in message
+    assert "--start" in message
+
+
+def test_under_the_guard_proceeds(monkeypatch, tmp_path):
+    _stub_transcription(monkeypatch, tmp_path, 59 * 60.0)
+    segments, backend = whisper.transcribe_video(
+        "v.mp4", tmp_path / "a.mp3", backend="groq", api_key="k"
+    )
+    assert backend == "groq" and segments
+
+
+def test_focus_window_is_what_gets_guarded(monkeypatch, tmp_path):
+    """A 4-hour source with a 2-minute window uploads 2 minutes — no refusal."""
+    _stub_transcription(monkeypatch, tmp_path, 4 * 3600.0)
+    segments, _ = whisper.transcribe_video(
+        "v.mp4", tmp_path / "a.mp3", backend="groq", api_key="k",
+        start_seconds=600.0, end_seconds=720.0,
+    )
+    assert segments
+
+
+def test_transcribe_anyway_lifts_the_guard(monkeypatch, tmp_path):
+    _stub_transcription(monkeypatch, tmp_path, 2 * 3600.0)
+    segments, _ = whisper.transcribe_video(
+        "v.mp4", tmp_path / "a.mp3", backend="groq", api_key="k", allow_long=True,
+    )
+    assert segments
+
+
+def test_custom_backend_is_exempt(monkeypatch, tmp_path, capsys):
+    """localhost is free per-minute; the guard would only block a local server
+    doing exactly what it was set up for. An informational line still prints."""
+    monkeypatch.setenv("WATCH_WHISPER_ENDPOINT", "http://127.0.0.1:9000/v1/audio/transcriptions")
+    _stub_transcription(monkeypatch, tmp_path, 2 * 3600.0)
+    segments, backend = whisper.transcribe_video(
+        "v.mp4", tmp_path / "a.mp3", backend="custom", api_key="",
+    )
+    assert backend == "custom" and segments
+    assert "self-hosted endpoint" in capsys.readouterr().err
+
+
+def test_refusal_subclasses_systemexit():
+    """Existing `except SystemExit` call sites must keep working; watch.py
+    catches the subclass FIRST to report the honest reason."""
+    assert issubclass(whisper.LongAudioRefusal, SystemExit)

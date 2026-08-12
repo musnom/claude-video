@@ -4,6 +4,7 @@
 Modes:
   setup.py --check      Silent preflight. Exit 0 if ready, 2/3/4 on failure.
   setup.py --json       Machine-readable status for Claude to parse.
+  setup.py --complete   Record that setup is finished (keyless is a valid choice).
   setup.py              Installer. Auto-installs deps, scaffolds .env, marks SETUP_COMPLETE.
 
 Design:
@@ -29,7 +30,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from config import decode_env_bytes, ensure_utf8_console, get_config, read_env_file  # noqa: E402
+from config import decode_env_bytes, ensure_utf8_console, env_file_paths, get_config, read_setting  # noqa: E402
 
 # Before any print: cmd_install writes an em dash and the config path, which
 # raise on a piped Windows console under the ANSI code page.
@@ -109,17 +110,15 @@ def _check_file_permissions(path: Path) -> None:
         pass
 
 
-def _read_env_key(name: str) -> str | None:
-    value = os.environ.get(name)
-    if value and value.strip():
-        return value.strip()
-    if not CONFIG_FILE.exists():
-        return None
-    _check_file_permissions(CONFIG_FILE)
-    # One parser for the whole codebase. This used to be a third private copy,
-    # which is how the inline-comment stripping added to read_env_file never
-    # reached the other two.
-    return read_env_file(CONFIG_FILE).get(name) or None
+def _read_env_key(name: str, include_cwd: bool = True) -> str | None:
+    """One parser AND one path list for the whole codebase (config.read_setting:
+    env → ~/.config/watch/.env → ./.env). This used to read only the config
+    file, so a project-local GROQ_API_KEY transcribed fine (whisper.py always
+    honored ./.env) while --check reported needs_key and the hook nagged."""
+    for path in env_file_paths(include_cwd):
+        if path.exists():
+            _check_file_permissions(path)
+    return read_setting(name, include_cwd=include_cwd)
 
 
 def _have_api_key() -> tuple[bool, str | None]:
@@ -139,8 +138,15 @@ def _have_api_key() -> tuple[bool, str | None]:
 
 
 def is_first_run() -> bool:
-    """True if the installer hasn't completed successfully yet."""
-    return _read_env_key("SETUP_COMPLETE") != "true"
+    """True if the installer hasn't completed successfully yet.
+
+    SETUP_COMPLETE is read from the machine config only, never from a project
+    ./.env — a cloned repo shipping the marker must not suppress another user's
+    first-run flow. (Keys ARE honored from ./.env; the difference is that keys
+    are credentials the user placed, while this marker is a statement about the
+    machine's setup history.)
+    """
+    return _read_env_key("SETUP_COMPLETE", include_cwd=False) != "true"
 
 
 def _scaffold_env() -> bool:
@@ -316,6 +322,21 @@ def cmd_json() -> int:
     return 0
 
 
+def cmd_complete() -> int:
+    """Record that setup is finished — including the deliberate keyless choice.
+
+    The installer only wrote SETUP_COMPLETE when a key was present, so a user
+    who declined Whisper had no tool-supported way to say "I'm done": --check
+    kept exiting 3 and the SessionStart hook nagged every session until someone
+    hand-edited the .env. SKILL.md's promise that a keyless install is "never
+    nagged again" depends on this command existing.
+    """
+    _scaffold_env()
+    _write_setup_complete()
+    print(f"[setup] recorded: setup complete (keyless is allowed). {CONFIG_FILE}")
+    return 0
+
+
 def cmd_install() -> int:
     missing = _check_binaries()
     installed_deps = False
@@ -365,7 +386,11 @@ def cmd_install() -> int:
     print("    GROQ_API_KEY=...    (preferred — cheaper, faster; get one at console.groq.com/keys)")
     print("    OPENAI_API_KEY=...  (fallback; get one at platform.openai.com/api-keys)")
     print("")
-    print("  Without a key, /watch still works but videos without captions come back frames-only.")
+    print("  Fully local instead: point WATCH_WHISPER_ENDPOINT at an OpenAI-compatible")
+    print("  server (whisper.cpp's whisper-server, speaches, LocalAI) — no key, no upload.")
+    print("")
+    print("  Without any of these, /watch still works but videos without captions come")
+    print(f"  back frames-only. To skip transcription deliberately: python3 {Path(__file__).resolve()} --complete")
     return 3
 
 
@@ -376,6 +401,8 @@ def main() -> int:
             return cmd_check()
         if arg == "--json":
             return cmd_json()
+        if arg == "--complete":
+            return cmd_complete()
     return cmd_install()
 
 

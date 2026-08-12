@@ -10,6 +10,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path.home() / ".config" / "watch"
 CONFIG_FILE = CONFIG_DIR / ".env"
+_IMPORT_TIME_CONFIG_FILE = CONFIG_FILE
 
 DEFAULT_DETAIL = "balanced"
 
@@ -118,9 +119,56 @@ def decode_env_bytes(data: bytes, path: Path | None = None) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _config_file() -> Path:
+    """The user config path, resolved at call time.
+
+    ``Path.home()`` is re-resolved per call rather than frozen at import: the
+    test suite (and any long-lived host) changes HOME after this module is
+    imported, and whisper.py's historical private path list resolved at call
+    time — that behavior is the compatibility anchor. A test that monkeypatches
+    ``config.CONFIG_FILE`` still wins: an attribute that no longer matches its
+    import-time value was changed deliberately.
+    """
+    if CONFIG_FILE is not _IMPORT_TIME_CONFIG_FILE:
+        return CONFIG_FILE
+    return Path.home() / ".config" / "watch" / ".env"
+
+
+def env_file_paths(include_cwd: bool = True) -> list[Path]:
+    """Where settings may live, in precedence order after the process env."""
+    paths = [_config_file()]
+    if include_cwd:
+        paths.append(Path.cwd() / ".env")
+    return paths
+
+
+def read_setting(name: str, include_cwd: bool = True) -> str | None:
+    """One resolution order for every consumer: process env, then
+    ``~/.config/watch/.env``, then ``./.env``.
+
+    This is the order whisper.py always used; config and setup used to stop at
+    the config file, so a project-local ``GROQ_API_KEY`` transcribed fine while
+    ``setup.py --check`` reported ``needs_key`` and the session hook nagged.
+    SKILL.md promises the cwd fallback for all of them.
+
+    ``include_cwd=False`` exists for ``SETUP_COMPLETE``: keys are credentials
+    the user placed for a project, but the setup marker is a statement about
+    this *machine* — honoring it from a project ``.env`` would let a cloned
+    repo suppress another user's first-run flow.
+    """
+    value = os.environ.get(name)
+    if value and value.strip():
+        return value.strip()
+    for path in env_file_paths(include_cwd):
+        value = read_env_file(path).get(name)
+        if value:
+            return value
+    return None
+
+
 def read_env_file(path: Path | None = None) -> dict[str, str]:
     if path is None:
-        path = CONFIG_FILE
+        path = _config_file()
     values: dict[str, str] = {}
     if not path.exists():
         return values
@@ -130,6 +178,11 @@ def read_env_file(path: Path | None = None) -> dict[str, str]:
         return values
     for line in lines:
         raw = line.strip()
+        # `export KEY=value` — a user who writes their .env to be
+        # `source`-able — used to parse into the key "export KEY", which
+        # silently never matched anything.
+        if raw.startswith("export ") or raw.startswith("export\t"):
+            raw = raw[7:].lstrip()
         if not raw or raw.startswith("#") or "=" not in raw:
             continue
         key, _, value = raw.partition("=")
@@ -150,19 +203,13 @@ def read_env_file(path: Path | None = None) -> dict[str, str]:
 
 
 def get_config() -> dict[str, object]:
-    file_values = read_env_file()
-
-    detail = (
-        os.environ.get("WATCH_DETAIL")
-        or file_values.get("WATCH_DETAIL")
-        or DEFAULT_DETAIL
-    )
+    detail = read_setting("WATCH_DETAIL") or DEFAULT_DETAIL
     if detail not in DETAILS:
         detail = DEFAULT_DETAIL
 
     return {
         "detail": detail,
-        "config_file": str(CONFIG_FILE),
+        "config_file": str(_config_file()),
     }
 
 

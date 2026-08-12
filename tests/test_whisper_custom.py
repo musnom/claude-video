@@ -210,7 +210,12 @@ def test_endpoint_is_read_from_the_config_file(tmp_path, monkeypatch):
 
 
 def test_setup_treats_a_custom_endpoint_as_configured(tmp_path, monkeypatch):
-    """Otherwise a self-hosted user is nagged for a cloud key on every run."""
+    """Otherwise a self-hosted user is nagged for a cloud key on every run.
+
+    Isolated via HOME rather than by monkeypatching setup's CONFIG_FILE: setup
+    no longer has a private read path — it resolves through config.read_setting
+    like whisper.py, which is the whole point of the shared resolver.
+    """
     home = tmp_path / "home"
     cfg = home / ".config" / "watch"
     cfg.mkdir(parents=True)
@@ -218,7 +223,8 @@ def test_setup_treats_a_custom_endpoint_as_configured(tmp_path, monkeypatch):
         "WATCH_WHISPER_ENDPOINT=http://127.0.0.1:9000/v1/audio/transcriptions\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(setup_mod, "CONFIG_FILE", cfg / ".env")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("WATCH_WHISPER_ENDPOINT", raising=False)

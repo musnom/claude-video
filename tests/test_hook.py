@@ -6,6 +6,7 @@ about.
 """
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -156,3 +157,99 @@ def test_hook_script_has_no_crlf():
     checkout silently disables the hook.
     """
     assert b"\r\n" not in HOOK.read_bytes()
+
+
+# --- resolution parity with setup.py --check ------------------------------------
+# The hook must agree with setup.py about what counts as configured, or the nag
+# mismatch just moves: a value the hook cannot read is a hint printed on every
+# session for a user who is fully set up.
+
+
+def test_value_containing_equals_survives(tmp_path):
+    """awk -F= truncated `GROQ_API_KEY=abc==def` at the first '='; base64
+    padding in real keys makes this a real shape."""
+    home = tmp_path / "home"
+    _write_env(home, b"GROQ_API_KEY=abc==def\nSETUP_COMPLETE=true\n")
+    assert _run(home, _stub_bin(tmp_path)).stdout == ""
+
+
+def test_export_prefixed_lines_are_read(tmp_path):
+    home = tmp_path / "home"
+    _write_env(home, b"export SETUP_COMPLETE=true\nexport GROQ_API_KEY=abc\n")
+    assert _run(home, _stub_bin(tmp_path)).stdout == ""
+
+
+def test_key_without_marker_is_silent(tmp_path):
+    """A key alone (e.g. set in the shell profile) is a configured user. The
+    old rule required SETUP_COMPLETE specifically and printed '/watch: ready.'
+    on EVERY session — the exact spam the script's header promises not to emit."""
+    home = tmp_path / "home"
+    _write_env(home, b"GROQ_API_KEY=abc\n")
+    result = _run(home, _stub_bin(tmp_path))
+    assert result.stdout == "", result.stdout
+
+
+def test_endpoint_only_user_is_silent(tmp_path):
+    """A self-hosted WATCH_WHISPER_ENDPOINT needs no key; the hook used to nag
+    that user for a cloud key on every session because it never read the var."""
+    home = tmp_path / "home"
+    _write_env(home, b"WATCH_WHISPER_ENDPOINT=http://127.0.0.1:8080/v1/audio/transcriptions\n")
+    assert _run(home, _stub_bin(tmp_path)).stdout == ""
+
+
+def test_project_env_key_is_honored(tmp_path):
+    """Same ./.env fallback config.read_setting has — run the hook from a
+    project directory whose .env carries the key."""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text("GROQ_API_KEY=abc\n", encoding="utf-8")
+    stub = _stub_bin(tmp_path)
+    env = {
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin",
+    }
+    result = subprocess.run(
+        ["bash", str(HOOK)], capture_output=True, text=True, env=env, cwd=project,
+    )
+    assert result.stdout == "", result.stdout
+
+
+def test_project_env_cannot_mark_setup_complete(tmp_path):
+    """SETUP_COMPLETE from a project .env must NOT silence the first-run hint."""
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text("SETUP_COMPLETE=true\n", encoding="utf-8")
+    stub = _stub_bin(tmp_path)
+    env = {
+        "HOME": str(home),
+        "USERPROFILE": str(home),
+        "PATH": f"{stub}:/usr/bin:/bin:/usr/sbin:/sbin",
+    }
+    result = subprocess.run(
+        ["bash", str(HOOK)], capture_output=True, text=True, env=env, cwd=project,
+    )
+    assert "GROQ_API_KEY" in result.stdout
+
+
+def test_remediation_hint_names_a_real_path(tmp_path):
+    """The old hint printed a literal `$CLAUDE_PLUGIN_ROOT` the user's shell
+    cannot expand, so copy-pasting it ran `python3 /skills/...`. The printed
+    path must exist (resolved from the script's own location as fallback)."""
+    home = tmp_path / "home"
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    result = subprocess.run(
+        ["bash", str(HOOK)], capture_output=True, text=True,
+        env={"HOME": str(home), "USERPROFILE": str(home),
+             "PATH": f"{empty}:/usr/bin:/bin:/usr/sbin:/sbin"},
+    )
+    assert "needs ffmpeg + yt-dlp" in result.stdout
+    assert "$CLAUDE_PLUGIN_ROOT" not in result.stdout
+    match = re.search(r"`python3 (\S+/setup\.py)`", result.stdout)
+    assert match, result.stdout
+    assert Path(match.group(1)).is_file(), match.group(1)

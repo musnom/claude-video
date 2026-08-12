@@ -26,32 +26,64 @@ if [[ -f "$CONFIG_FILE" ]] && ! _is_windows_shell; then
   fi
 fi
 
-# Load API keys from the config file without exporting them.
+# Read one value out of a .env file, tolerating the encodings Windows tooling
+# writes and the shapes users write.
+read_env_from() {
+  local file="$1" name="$2"
+  # Windows tooling writes this file in encodings awk cannot read: PowerShell's
+  # Out-File defaults to UTF-16LE with a BOM, Notepad adds a UTF-8 BOM. Strip
+  # NUL and BOM bytes first so the keys — all ASCII — survive; without this
+  # SETUP_COMPLETE never matches and the hook nags on every session.
+  #
+  # LC_ALL=C is required, not cosmetic: in a UTF-8 locale BSD tr errors with
+  # "Illegal byte sequence" on the UTF-16 BOM and silently passes the UTF-8
+  # BOM straight through. \015 is belt-and-braces for CRLF.
+  #
+  # index/substr rather than -F=: an API key containing '=' (base64 padding is
+  # real) was silently truncated at the first one by field splitting. A leading
+  # `export ` — a user who writes their .env to be source-able — is stripped so
+  # the key still matches.
+  LC_ALL=C tr -d '\000\377\376\357\273\277\015' < "$file" | awk -v k="$name" '
+    /^[[:space:]]*#/ { next }
+    {
+      line = $0
+      sub(/^[[:space:]]*export[[:space:]]+/, "", line)
+      eq = index(line, "=")
+      if (eq == 0) next
+      key = substr(line, 1, eq - 1)
+      gsub(/[[:space:]]/, "", key)
+      if (key != k) next
+      val = substr(line, eq + 1)
+      sub(/^[[:space:]]*/, "", val); sub(/[[:space:]]*$/, "", val)
+      gsub(/^["'\'']|["'\'']$/, "", val)
+      print val; exit
+    }
+  '
+}
+
+# Resolution order mirrors config.read_setting: process env, then the machine
+# config, then the project .env — except SETUP_COMPLETE, which is machine-config
+# only (a cloned repo shipping the marker must not silence another user's
+# first-run flow). The hook must agree with `setup.py --check` about what is
+# configured, or the nag mismatch just moves.
 read_key() {
   local name="$1"
   if [[ -n "${!name:-}" ]]; then
     echo "${!name}"
     return
   fi
-  if [[ -f "$CONFIG_FILE" ]]; then
-    # Windows tooling writes this file in encodings awk cannot read: PowerShell's
-    # Out-File defaults to UTF-16LE with a BOM, Notepad adds a UTF-8 BOM. Strip
-    # NUL and BOM bytes first so the keys — all ASCII — survive; without this
-    # SETUP_COMPLETE never matches and the hook nags on every session.
-    #
-    # LC_ALL=C is required, not cosmetic: in a UTF-8 locale BSD tr errors with
-    # "Illegal byte sequence" on the UTF-16 BOM and silently passes the UTF-8
-    # BOM straight through. \015 is belt-and-braces for CRLF (POSIX awk's
-    # [:space:] already strips a trailing CR).
-    LC_ALL=C tr -d '\000\377\376\357\273\277\015' < "$CONFIG_FILE" | awk -F= -v k="$name" '
-      /^[[:space:]]*#/ { next }
-      $1 == k {
-        sub(/^[[:space:]]*/, "", $2); sub(/[[:space:]]*$/, "", $2);
-        gsub(/^["'\'']|["'\'']$/, "", $2);
-        print $2; exit
-      }
-    '
-  fi
+  local file value
+  for file in "$CONFIG_FILE" "$PWD/.env"; do
+    if [[ "$name" == "SETUP_COMPLETE" && "$file" != "$CONFIG_FILE" ]]; then
+      continue
+    fi
+    [[ -f "$file" ]] || continue
+    value="$(read_env_from "$file" "$name")"
+    if [[ -n "$value" ]]; then
+      echo "$value"
+      return
+    fi
+  done
 }
 
 HAS_FFMPEG=""
@@ -61,18 +93,27 @@ command -v yt-dlp >/dev/null 2>&1 && HAS_YTDLP="yes"
 
 HAS_GROQ="$(read_key GROQ_API_KEY)"
 HAS_OPENAI="$(read_key OPENAI_API_KEY)"
+HAS_ENDPOINT="$(read_key WATCH_WHISPER_ENDPOINT)"
 SETUP_COMPLETE="$(read_key SETUP_COMPLETE)"
 
-# Fully configured → silent (Claude can surface status on demand via --check).
-if [[ "$SETUP_COMPLETE" == "true" && -n "$HAS_FFMPEG" && -n "$HAS_YTDLP" ]]; then
+# Ready → silent. "Ready" mirrors setup.py's can_proceed: binaries present AND
+# (setup completed OR any transcription backend configured — including a
+# self-hosted endpoint, which needs no key). The old rule required
+# SETUP_COMPLETE specifically, so a user whose key lives in the shell profile
+# got a "/watch: ready." line on EVERY session — the exact spam the header
+# above promises not to emit.
+if [[ -n "$HAS_FFMPEG" && -n "$HAS_YTDLP" ]] && \
+   [[ "$SETUP_COMPLETE" == "true" || -n "$HAS_GROQ" || -n "$HAS_OPENAI" || -n "$HAS_ENDPOINT" ]]; then
   exit 0
 fi
 
 # First-run / partially-configured → one-line hint.
 if [[ -z "$HAS_FFMPEG" || -z "$HAS_YTDLP" ]]; then
-  echo "/watch: needs ffmpeg + yt-dlp. Run \`python3 \$CLAUDE_PLUGIN_ROOT/skills/watch/scripts/setup.py\` once to install and scaffold config."
-elif [[ -z "$HAS_GROQ" && -z "$HAS_OPENAI" ]]; then
-  echo "/watch: ready for videos with native captions. Add GROQ_API_KEY (preferred) or OPENAI_API_KEY to ~/.config/watch/.env to unlock Whisper fallback."
+  # A real path, not a literal "$CLAUDE_PLUGIN_ROOT" the user's shell cannot
+  # expand: resolve the plugin root from this script's own location, with the
+  # env var (set when the harness runs the hook) as first choice.
+  PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+  echo "/watch: needs ffmpeg + yt-dlp. Run \`python3 $PLUGIN_ROOT/skills/watch/scripts/setup.py\` once to install and scaffold config."
 else
-  echo "/watch: ready."
+  echo "/watch: ready for videos with native captions. Add GROQ_API_KEY (preferred) or OPENAI_API_KEY to ~/.config/watch/.env — or point WATCH_WHISPER_ENDPOINT at a local server — to unlock the Whisper fallback."
 fi

@@ -21,18 +21,26 @@ WATCH_ENV_VARS = (
     "GROQ_API_KEY",
     "OPENAI_API_KEY",
     "SETUP_COMPLETE",
+    "WATCH_WHISPER_ENDPOINT",
+    "WATCH_WHISPER_MODEL",
+    "WATCH_SUB_LANGS",
 )
 
 
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch):
-    """Run every test against an empty HOME with no /watch env vars set.
+    """Run every test against an empty HOME and an empty CWD with no /watch env
+    vars set.
 
     Without this the suite reads the developer's real ``~/.config/watch/.env``:
     the subprocess-driven tests in test_setup.py and test_watch.py inherit HOME,
     and ``whisper.load_api_key`` resolves ``Path.home()`` at call time. A machine
     with ``WATCH_DETAIL=transcript`` configured fails four tests on a clean
     checkout, because /watch then extracts no frames.
+
+    The chdir matters for the same reason since config.read_setting gained the
+    ``./.env`` fallback SKILL.md promises: pytest runs from the repo root, so a
+    developer's stray ``./.env`` would otherwise leak into every test.
 
     This is a *baseline* only. Tests that need a populated config still override
     HOME themselves (test_setup.py's ``_run(home=...)``) or monkeypatch the
@@ -45,6 +53,7 @@ def isolated_home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.
     home = tmp_path_factory.mktemp("home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.chdir(home)
     for name in WATCH_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     return home

@@ -35,3 +35,39 @@ def test_frame_cap_mapping():
     assert config.frame_cap("token-burner") is None
     assert config.frame_cap("transcript") is None
     assert config.frame_cap("anything-else") == 100
+
+
+# --- read_setting: one resolution order for every consumer ----------------------
+
+
+def test_read_setting_env_beats_config_beats_cwd(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    cfg = home / ".config" / "watch"
+    cfg.mkdir(parents=True)
+    (cfg / ".env").write_text("K=from-config\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".env").write_text("K=from-cwd\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.chdir(project)
+
+    monkeypatch.setenv("K", "from-env")
+    assert config.read_setting("K") == "from-env"
+    monkeypatch.delenv("K")
+    assert config.read_setting("K") == "from-config"
+    (cfg / ".env").write_text("OTHER=x\n", encoding="utf-8")
+    assert config.read_setting("K") == "from-cwd"
+    assert config.read_setting("K", include_cwd=False) is None
+
+
+def test_export_prefixed_lines_parse(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(
+        'export GROQ_API_KEY=sk-abc\nexport\tWATCH_DETAIL=efficient\nVALUE="export inside"\n',
+        encoding="utf-8",
+    )
+    values = config.read_env_file(env)
+    assert values["GROQ_API_KEY"] == "sk-abc"
+    assert values["WATCH_DETAIL"] == "efficient"
+    assert values["VALUE"] == "export inside"

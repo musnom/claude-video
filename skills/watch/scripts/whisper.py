@@ -14,7 +14,6 @@ import io
 import json
 import math
 import mimetypes
-import os
 import shutil
 import ssl
 import subprocess
@@ -28,7 +27,7 @@ from urllib.request import Request, urlopen
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-from config import read_env_file  # noqa: E402
+from config import read_setting  # noqa: E402
 
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -48,20 +47,11 @@ CUSTOM_MODEL_DEFAULT = "whisper-1"
 
 
 def _setting(name: str) -> str | None:
-    """Read a setting from the environment, else ~/.config/watch/.env or ./.env.
-
-    Routed through config.read_env_file rather than a private parser so the
-    quote and inline-comment handling is shared — a trailing `  # local box`
-    otherwise ends up inside the URL.
+    """Read a setting via config.read_setting — one parser AND one path list
+    for the whole codebase (env → ~/.config/watch/.env → ./.env). This module's
+    resolution order was the compatibility anchor the shared helper adopted.
     """
-    value = os.environ.get(name)
-    if value and value.strip():
-        return value.strip()
-    for path in (Path.home() / ".config" / "watch" / ".env", Path.cwd() / ".env"):
-        value = read_env_file(path).get(name)
-        if value:
-            return value
-    return None
+    return read_setting(name)
 
 
 def custom_endpoint() -> str | None:
@@ -71,6 +61,32 @@ def custom_endpoint() -> str | None:
 # Both Groq's free tier and OpenAI whisper-1 cap uploads at 25 MB. We target a
 # margin under that so multipart framing overhead never pushes a chunk over.
 MAX_UPLOAD_BYTES = 24 * 1024 * 1024
+
+# Cloud-transcription duration guard. A captionless 4-hour video used to upload
+# ~4 hours of audio with no estimate and no confirmation — billed per audio
+# minute on both providers. 60 minutes as the line: it is where the upload is
+# guaranteed multi-chunk, ~6x the SKILL's own "best accuracy under 10 minutes"
+# guidance, and anything past it is nearly always better served by
+# --start/--end. The refusal (not a warning — a warning printed while the
+# upload proceeds guards nothing; --motion set the house precedent) names the
+# exact re-run flag, so the caller relays the estimate to the user and re-runs
+# with --transcribe-anyway on a yes. The self-hosted backend is exempt:
+# localhost is free per-minute.
+WHISPER_GUARD_SECONDS = 60 * 60.0
+
+# Rough per-minute list prices for the refusal message. Order-of-magnitude
+# honesty, not billing data — both providers change prices.
+_APPROX_USD_PER_MINUTE = {"openai": 0.006, "groq": 0.002}
+
+
+class LongAudioRefusal(SystemExit):
+    """Refused before upload: audio exceeds WHISPER_GUARD_SECONDS.
+
+    Subclasses SystemExit so existing `except SystemExit` call sites and the
+    module CLI keep working; watch.py catches THIS type specifically so the
+    report can state the real reason instead of "no API key". Any future
+    `except Exception` around transcription would miss it — deliberately.
+    """
 
 
 def plan_chunks(
@@ -110,33 +126,18 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
         if custom_endpoint():
             return "custom", ""
         return None, None
-    def _from_env(name: str) -> str | None:
-        value = os.environ.get(name)
-        return value.strip() if value else None
-
-    def _from_dotenv(path: Path, name: str) -> str | None:
-        # Shares config.read_env_file rather than parsing again. The private
-        # copy this replaces never got the inline-comment stripping, so
-        # `GROQ_API_KEY=abc  # prod key` was sent verbatim as the bearer token
-        # and came back as a 401 that looked like a bad key.
-        return read_env_file(path).get(name) or None
-
-    dotenv_paths = [
-        Path.home() / ".config" / "watch" / ".env",
-        Path.cwd() / ".env",
-    ]
 
     candidates = (("GROQ_API_KEY", "groq"), ("OPENAI_API_KEY", "openai"))
     if preferred is not None:
         candidates = tuple(c for c in candidates if c[1] == preferred)
 
     for key_name, backend in candidates:
-        value = _from_env(key_name)
-        if not value:
-            for candidate in dotenv_paths:
-                value = _from_dotenv(candidate, key_name)
-                if value:
-                    break
+        # config.read_setting shares the parser (quote + inline-comment
+        # handling — the private copy this replaced once sent
+        # `GROQ_API_KEY=abc  # prod key` verbatim as the bearer token) AND the
+        # path list, so setup.py and the hook agree with this module about
+        # which key exists.
+        value = read_setting(key_name)
         if value:
             return backend, value
 
@@ -167,6 +168,7 @@ def extract_audio(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-hide_banner",
         "-loglevel", "error",
         "-y",
@@ -257,6 +259,7 @@ def split_audio(
         out_path = work_dir / f"chunk_{index:03d}.mp3"
         cmd = [
             "ffmpeg",
+            "-nostdin",
             "-hide_banner",
             "-loglevel", "error",
             "-y",
@@ -309,6 +312,16 @@ def _build_multipart(fields: dict[str, str], file_path: Path) -> tuple[bytes, st
 MAX_ATTEMPTS = 4       # initial + 3 retries
 MAX_429_RETRIES = 2
 RETRY_BASE_DELAY = 2.0
+# Longest server-requested wait this client will honor. Per-minute rate limits
+# carry Retry-After values of seconds to tens of seconds — worth sleeping
+# through. Daily-quota 429s carry HOURS, and honoring one meant /watch printed
+# a single line and then blocked the whole session (Groq's quota-exhaustion
+# values were measured in the multi-hour range). 60s also stays inside typical
+# harness command timeouts, so the failure message is seen instead of the
+# process being killed mid-sleep. Past the ceiling the caller is told the
+# server's number and decides — switch backends, tell the user, re-run later —
+# which a sleeping process cannot do.
+RETRY_AFTER_CEILING = 60.0
 
 
 def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> dict:
@@ -353,7 +366,17 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
                 rate_limit_hits += 1
                 if rate_limit_hits >= MAX_429_RETRIES:
                     raise SystemExit(f"Whisper request failed: {exc}{detail}")
-                delay = _retry_after(exc) or RETRY_BASE_DELAY * (2 ** attempt) + 1
+                retry_after = _retry_after(exc)
+                if retry_after is not None and retry_after > RETRY_AFTER_CEILING:
+                    raise SystemExit(
+                        f"Whisper request failed: {exc}{detail} — the server asked to "
+                        f"retry after {retry_after:.0f}s (~{retry_after / 60:.0f} min), "
+                        f"over the {RETRY_AFTER_CEILING:.0f}s ceiling. That is quota "
+                        "exhaustion, not a transient rate limit; sleeping through it "
+                        "would hang this run. Try the other backend (--whisper openai / "
+                        "--whisper groq), or re-run after the quota resets."
+                    )
+                delay = retry_after or RETRY_BASE_DELAY * (2 ** attempt) + 1
             else:
                 delay = RETRY_BASE_DELAY * (2 ** attempt)
 
@@ -509,6 +532,7 @@ def transcribe_video(
     *,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
+    allow_long: bool = False,
 ) -> tuple[list[dict], str]:
     """Run the full flow: extract audio → upload → parse segments.
 
@@ -537,6 +561,39 @@ def transcribe_video(
             "at a self-hosted OpenAI-compatible server. "
             f"Run `python3 {setup_py}` to configure."
         )
+
+    # Guard BEFORE the encode, on one cheap ffprobe of the source: the window
+    # when one was given, else the full duration. The estimate can only shrink
+    # after encoding, so refusing here never refuses a run the post-encode
+    # number would have allowed by more than rounding.
+    try:
+        source_seconds = audio_duration(Path(video_path))
+    except SystemExit:
+        source_seconds = 0.0
+    if end_seconds is not None:
+        estimated_seconds = max(0.0, end_seconds - (start_seconds or 0.0))
+    elif start_seconds:
+        estimated_seconds = max(0.0, source_seconds - start_seconds)
+    else:
+        estimated_seconds = source_seconds
+    if estimated_seconds > WHISPER_GUARD_SECONDS:
+        minutes = estimated_seconds / 60.0
+        if backend == "custom":
+            print(
+                f"[watch] transcribing ~{minutes:.0f} minutes of audio on the "
+                "self-hosted endpoint (long, but local and free per-minute)…",
+                file=sys.stderr,
+            )
+        elif not allow_long:
+            per_minute = _APPROX_USD_PER_MINUTE.get(backend, 0.006)
+            est_chunks = max(1, math.ceil(estimated_seconds * 8000 / MAX_UPLOAD_BYTES))
+            raise LongAudioRefusal(
+                f"Whisper upload guard: ~{minutes:.0f} minutes of audio would be "
+                f"uploaded to {backend} (~{est_chunks} chunk(s), roughly "
+                f"${minutes * per_minute:.2f} at {backend} list rates). "
+                "Re-run with --transcribe-anyway to proceed, --start/--end to "
+                "transcribe a section, or --no-whisper to skip transcription."
+            )
 
     scope = (
         f" over {start_seconds or 0:.1f}-{end_seconds:.1f}s" if end_seconds is not None
@@ -585,7 +642,11 @@ def transcribe_video(
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai]", file=sys.stderr)
+        print(
+            "usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai] "
+            "[--transcribe-anyway]",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
 
     video = sys.argv[1]
@@ -594,5 +655,8 @@ if __name__ == "__main__":
     if "--backend" in sys.argv:
         backend_override = sys.argv[sys.argv.index("--backend") + 1]
 
-    segments, backend = transcribe_video(video, audio_out, backend=backend_override)
+    segments, backend = transcribe_video(
+        video, audio_out, backend=backend_override,
+        allow_long="--transcribe-anyway" in sys.argv,
+    )
     print(json.dumps({"backend": backend, "segments": segments}, indent=2))
