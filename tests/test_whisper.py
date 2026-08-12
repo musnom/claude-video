@@ -170,6 +170,13 @@ class TestExtractAudioRange:
 
         def fake_run(cmd, *args, **kwargs):
             calls.append(list(cmd))
+            # Write the output the real ffmpeg would, so extract_audio's
+            # exists/size checks pass NATURALLY. The previous version
+            # monkeypatched Path.exists/Path.stat class-wide instead, which
+            # broke Python 3.12's pathlib internally (mkdir's exist_ok handling
+            # routes through the patched stat there but not on 3.13+) — a
+            # CI-only failure the local 3.14 suite could never reproduce.
+            Path(cmd[-1]).write_bytes(b"mp3")
 
             class _Result:
                 returncode = 0
@@ -178,8 +185,6 @@ class TestExtractAudioRange:
             return _Result()
 
         monkeypatch.setattr(whisper.subprocess, "run", fake_run)
-        monkeypatch.setattr(whisper.Path, "exists", lambda self: True)
-        monkeypatch.setattr(whisper.Path, "stat", lambda self: type("S", (), {"st_size": 1})())
         # These tests are about argv construction, so the emptiness guard — which
         # really does shell out to ffprobe — is stubbed rather than exercised. It
         # has its own test below.
