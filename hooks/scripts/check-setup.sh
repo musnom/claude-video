@@ -55,7 +55,16 @@ read_env_from() {
       if (key != k) next
       val = substr(line, eq + 1)
       sub(/^[[:space:]]*/, "", val); sub(/[[:space:]]*$/, "", val)
-      gsub(/^["'\'']|["'\'']$/, "", val)
+      # Same rule as config.read_env_file: quotes protect everything inside
+      # them; an UNQUOTED value loses a trailing inline comment, or
+      # `SETUP_COMPLETE=true  # done` reads as "true  # done" and fails the
+      # == "true" compare — a nag on every session.
+      if (val ~ /^".*"$/ || val ~ /^\x27.*\x27$/) {
+        val = substr(val, 2, length(val) - 2)
+      } else {
+        sub(/[[:space:]]+#.*$/, "", val)
+        sub(/[[:space:]]*$/, "", val)
+      }
       print val; exit
     }
   '
@@ -87,8 +96,12 @@ read_key() {
 }
 
 HAS_FFMPEG=""
+HAS_FFPROBE=""
 HAS_YTDLP=""
 command -v ffmpeg >/dev/null 2>&1 && HAS_FFMPEG="yes"
+# ffprobe is in setup.py's REQUIRED_BINARIES too — minimal/static ffmpeg
+# installs can carry ffmpeg without it, and the hook must agree with --check.
+command -v ffprobe >/dev/null 2>&1 && HAS_FFPROBE="yes"
 command -v yt-dlp >/dev/null 2>&1 && HAS_YTDLP="yes"
 
 HAS_GROQ="$(read_key GROQ_API_KEY)"
@@ -102,13 +115,13 @@ SETUP_COMPLETE="$(read_key SETUP_COMPLETE)"
 # SETUP_COMPLETE specifically, so a user whose key lives in the shell profile
 # got a "/watch: ready." line on EVERY session — the exact spam the header
 # above promises not to emit.
-if [[ -n "$HAS_FFMPEG" && -n "$HAS_YTDLP" ]] && \
+if [[ -n "$HAS_FFMPEG" && -n "$HAS_FFPROBE" && -n "$HAS_YTDLP" ]] && \
    [[ "$SETUP_COMPLETE" == "true" || -n "$HAS_GROQ" || -n "$HAS_OPENAI" || -n "$HAS_ENDPOINT" ]]; then
   exit 0
 fi
 
 # First-run / partially-configured → one-line hint.
-if [[ -z "$HAS_FFMPEG" || -z "$HAS_YTDLP" ]]; then
+if [[ -z "$HAS_FFMPEG" || -z "$HAS_FFPROBE" || -z "$HAS_YTDLP" ]]; then
   # A real path, not a literal "$CLAUDE_PLUGIN_ROOT" the user's shell cannot
   # expand: resolve the plugin root from this script's own location, with the
   # env var (set when the harness runs the hook) as first choice.

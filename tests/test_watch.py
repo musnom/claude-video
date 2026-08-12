@@ -382,7 +382,7 @@ def test_gap_fill_early_stop_is_reported(sparse_cuts_clip: Path):
     the frame count and the cap."""
     out = _run(sparse_cuts_clip, "--detail", "balanced")
     assert "fill stopped early" in out
-    assert "near-duplicate candidate" in out
+    assert "near-duplicate or blank candidate" in out
     assert "reason=gap-fill" not in out
 
 
@@ -746,3 +746,22 @@ def test_motion_frames_line_accounts_for_cue_frames(slide_clip: Path):
     assert listed == motion_count + cue_count
     # motion.json stays cue-free: it was serialized before the merge.
     assert "reason=transcript-cue" in out
+
+
+def test_motion_json_stays_cue_free(slide_clip: Path):
+    """motion.json is the measurement artifact; cue frames are context grabs.
+    The serialize-before-merge ordering that keeps them apart was previously
+    asserted only via a comment."""
+    import json as _json
+
+    out = _run(
+        slide_clip, "--motion", "--start", "0.9", "--end", "1.6",
+        "--timestamps", "1.0",
+    )
+    match = re.search(r"\*\*Motion data:\*\* `([^`]+)`", out)
+    assert match, out
+    data = _json.loads(Path(match.group(1)).read_text(encoding="utf-8"))
+    motion_count = int(re.search(r"\*\*Frames:\*\* (\d+) \+", out).group(1))
+    assert len(data["frames"]) == motion_count
+    # Every entry carries the motion-measurement keys cue frames lack.
+    assert all("cum_delta" in f for f in data["frames"])

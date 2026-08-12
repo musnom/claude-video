@@ -62,6 +62,29 @@ def _frame_stamp(frame: dict) -> str:
     return format_time(frame["timestamp_seconds"])
 
 
+def _whisper_miss_reason(transcription_error: str | None) -> str:
+    """The honest tail of a "no transcript" report line.
+
+    With a configured key whose request FAILED, the old unconditional "no API
+    key set, or --no-whisper was used" stated two falsehoods and routed the
+    reader to setup they had already done.
+    """
+    if transcription_error:
+        detail = transcription_error.strip().replace("\n", " ")
+        if len(detail) > 300:
+            detail = detail[:300] + "…"
+        return (
+            f"the Whisper request failed: {detail} "
+            "Retry with the other backend (`--whisper openai` / `--whisper groq`), "
+            "or re-run later."
+        )
+    setup_py = SCRIPT_DIR / "setup.py"
+    return (
+        "the Whisper fallback was unavailable (no API key set, or `--no-whisper` "
+        f"was used). Run `python3 {setup_py}` to enable Whisper, then re-run."
+    )
+
+
 def needs_pixels(cue_timestamps: list, motion: bool) -> bool:
     """Whether this run must download real video rather than audio-only.
 
@@ -383,6 +406,11 @@ def main() -> int:
         else:
             print("[watch] using local file…", file=sys.stderr)
             dl = download(args.source, work / "download")
+        # Re-checked on the post-download info: when the metadata fetch failed,
+        # the pre-download check saw {} and passed vacuously — but the download
+        # (bounded to one entry by --playlist-items) writes an info.json whose
+        # playlist markers now answer the question.
+        refuse_if_playlist(dl.get("info") or {})
         video_path = dl["video_path"]
 
     meta = get_metadata(video_path) if video_path else {
@@ -476,14 +504,19 @@ def main() -> int:
         # The clamp itself must be reported: the "--fps had no effect" warning
         # below cannot cover it, because on a uniform run the (clamped) rate DID
         # apply — the user asked for 25, sampling ran at 2, and nothing said so.
+        # Worded conditionally: which engine runs is not known yet, so "sampling
+        # at 2 fps" would be untrue on a scene/keyframe run.
         elif args.fps > MAX_FPS:
             print(
                 f"[watch] --fps {args.fps:g} exceeds the {MAX_FPS:g} fps auto-sampling "
-                f"ceiling — sampling at {MAX_FPS:g} fps",
+                f"ceiling — any uniform sampling will run at {MAX_FPS:g} fps",
                 file=sys.stderr,
             )
         fps = min(args.fps, MAX_FPS)
-        target = max(1, int(round(fps * effective_duration)))
+        # Bounded by the budget cap like every auto-derived target: unbounded,
+        # --fps 2 on a 10-minute token-burner run set a gap-fill target of 1200
+        # while the report said the flag "had no effect".
+        target = max(1, min(budget_cap, int(round(fps * effective_duration))))
 
     if transcript_segments and focused:
         transcript_segments = filter_range(transcript_segments, start_sec, end_sec)
@@ -658,10 +691,12 @@ def main() -> int:
     # engine asks the decoder which frames are I-frames and never computes a
     # scene metric at all, and motion mode takes every frame. Same rule as --fps
     # below — this codebase treats a silently ignored flag as a bug.
-    if args.scene_threshold is not None and (args.motion or detail == "efficient"):
-        why = "--motion samples every source frame" if args.motion else (
-            "--detail efficient selects keyframes, which the decoder marks and "
-            "which carry no scene score"
+    if args.scene_threshold is not None and (args.motion or detail in ("efficient", "transcript")):
+        why = (
+            "--motion samples every source frame" if args.motion
+            else "--detail transcript extracts no frames at all" if detail == "transcript"
+            else "--detail efficient selects keyframes, which the decoder marks and "
+                 "which carry no scene score"
         )
         print(
             f"[watch] --scene-threshold {args.scene_threshold} had no effect: {why}. "
@@ -706,6 +741,7 @@ def main() -> int:
             print(f"[watch] subtitle parse failed: {exc}", file=sys.stderr)
 
     transcription_refused_long = False
+    transcription_error: str | None = None
     if not transcript_segments and not args.no_whisper and video_path and meta.get("has_audio"):
         backend, api_key = load_api_key(args.whisper)
         # A self-hosted endpoint has no key, so `custom` is enough on its own.
@@ -734,6 +770,10 @@ def main() -> int:
                 transcription_refused_long = True
                 print(f"[watch] {exc}", file=sys.stderr)
             except SystemExit as exc:
+                # Remembered for the report: with a configured key, "no API key
+                # set" — the generic no-transcript text — is a false statement
+                # about a request the server actually refused.
+                transcription_error = str(exc)
                 print(f"[watch] whisper fallback failed: {exc}", file=sys.stderr)
         else:
             hint = (
@@ -906,8 +946,18 @@ def main() -> int:
         if filled or rejected:
             fill_note = f", {filled} added to fill gaps"
             if rejected:
+                # "stopped early" only when the fill actually did — the engine
+                # reports its stop cause, and a run whose rejections were
+                # followed by a fully spent budget did NOT stop early. Saying it
+                # did told the reader the remaining holes were static when
+                # raising --max-frames would have added coverage.
+                early = (
+                    "fill stopped early: "
+                    if frame_meta.get("gap_fill_stop") in ("saturated", "min-gap")
+                    else ""
+                )
                 fill_note += (
-                    f" (fill stopped early: {rejected} near-duplicate "
+                    f" ({early}{rejected} near-duplicate or blank "
                     f"candidate{'s' if rejected != 1 else ''} rejected)"
                 )
         if fill_failed:
@@ -1017,8 +1067,11 @@ def main() -> int:
             print()
             print(
                 f"{estimated_count} frame{'s are' if estimated_count != 1 else ' is'} "
-                "marked `estimated` — the measured time was unavailable for "
-                "them, so the label is the requested time, not a measured one."
+                "marked `estimated` — no measured time was available for them. "
+                "A uniform frame's estimate is its requested slot time; a "
+                "scene/keyframe frame's estimate repeats the last measured "
+                "timestamp, so several estimated frames may share one label. "
+                "Treat these labels as approximate."
             )
         print()
         for frame in frames:
@@ -1043,21 +1096,22 @@ def main() -> int:
         print("```")
         print(transcript_text)
         print("```")
-    elif detail == "transcript":
-        print(
-            "_No transcript available at transcript detail. Captions were missing and Whisper was "
-            "unavailable or failed, so there is no visual fallback here. Re-run with "
-            "`--detail balanced` for frames._"
-        )
     elif transcription_refused_long:
-        # The generic "no API key" text below would be false here — a key
-        # exists; the run was refused by the duration guard, and the honest
-        # report is the path to the override.
+        # BEFORE the transcript-detail branch: a transcript-detail run refused
+        # by the duration guard used to fall into that branch's "Whisper was
+        # unavailable or failed — re-run with --detail balanced" text, which is
+        # false (a key exists) and misdirects (balanced hits the same guard).
         print(
             "_No transcript: skipped by the Whisper duration guard — this source "
             "exceeds ~60 minutes of audio, which is a real API bill. Ask the user, "
             "then re-run with `--transcribe-anyway` to transcribe it all, or with "
             "`--start`/`--end` to transcribe a section._"
+        )
+    elif detail == "transcript":
+        print(
+            "_No transcript available at transcript detail. Captions were missing and Whisper was "
+            "unavailable or failed, so there is no visual fallback here. Re-run with "
+            "`--detail balanced` for frames._"
         )
     elif focused and dl.get("subtitle_path"):
         print(f"_No transcript lines fell inside {format_time(effective_start)} → {format_time(effective_end)}._")
@@ -1067,20 +1121,14 @@ def main() -> int:
         # reader looking for images that do not exist. On an audio-only source a
         # missing transcript means the run produced nothing at all, and the
         # report should say that rather than imply a fallback.
-        setup_py = SCRIPT_DIR / "setup.py"
         print(
-            "_No transcript available, and this source has no video stream — so there is "
-            "nothing to report. Captions were missing and the Whisper fallback was "
-            "unavailable (no API key set, or `--no-whisper` was used). "
-            f"Run `python3 {setup_py}` to enable Whisper, then re-run._"
+            "_No transcript available, and this source has no video stream — so "
+            f"there is nothing to report. Captions were missing and {_whisper_miss_reason(transcription_error)}_"
         )
     else:
-        setup_py = SCRIPT_DIR / "setup.py"
         print(
             "_No transcript available — proceed with frames only. "
-            "Captions were missing and the Whisper fallback was unavailable "
-            "(no API key set, or `--no-whisper` was used). "
-            f"Run `python3 {setup_py}` to enable Whisper, then re-run._"
+            f"Captions were missing and {_whisper_miss_reason(transcription_error)}_"
         )
 
     print()

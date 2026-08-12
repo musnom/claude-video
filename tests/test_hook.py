@@ -26,7 +26,7 @@ def _stub_bin(tmp_path: Path, *, uname: str | None = None) -> Path:
     """A PATH dir with the binaries the hook probes for."""
     d = tmp_path / "bin"
     d.mkdir(parents=True, exist_ok=True)
-    for name in ("ffmpeg", "yt-dlp"):
+    for name in ("ffmpeg", "ffprobe", "yt-dlp"):
         p = d / name
         p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         p.chmod(0o755)
@@ -275,3 +275,33 @@ def test_hooks_json_points_at_the_script_this_suite_tests():
     script = Path(shlex.split(resolved)[-1])
     assert script == HOOK
     assert script.is_file()
+
+
+def test_unquoted_inline_comment_is_stripped(tmp_path):
+    """`SETUP_COMPLETE=true  # done` must read as "true" — the same rule
+    config.read_env_file applies — or the marker never matches and the hook
+    nags every session."""
+    home = tmp_path / "home"
+    _write_env(home, b"GROQ_API_KEY=abc\nSETUP_COMPLETE=true  # done via wizard\n")
+    assert _run(home, _stub_bin(tmp_path)).stdout == ""
+
+
+def test_missing_ffprobe_gets_the_binaries_hint(tmp_path):
+    """ffprobe is in setup.py's REQUIRED_BINARIES; a minimal ffmpeg install
+    without it must not read as ready when --check would exit 2."""
+    home = tmp_path / "home"
+    _write_env(home, READY_ENV.encode("utf-8"))
+    d = tmp_path / "bin"
+    d.mkdir(parents=True, exist_ok=True)
+    for name in ("ffmpeg", "yt-dlp"):          # deliberately no ffprobe
+        p = d / name
+        p.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        p.chmod(0o755)
+    # System dirs kept for bash/tr/awk; ffprobe lives in Homebrew's prefix on
+    # macOS, so leaving that prefix out is what makes it "missing" here.
+    env = {
+        "HOME": str(home), "USERPROFILE": str(home),
+        "PATH": f"{d}:/usr/bin:/bin:/usr/sbin:/sbin",
+    }
+    result = subprocess.run(["bash", str(HOOK)], capture_output=True, text=True, env=env)
+    assert "needs ffmpeg + yt-dlp" in result.stdout

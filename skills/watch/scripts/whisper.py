@@ -89,6 +89,28 @@ class LongAudioRefusal(SystemExit):
     """
 
 
+class QuotaExhausted(SystemExit):
+    """A 429 whose Retry-After exceeds the ceiling: the server said hours.
+
+    Distinct from a plain per-request failure so transcribe_chunks can abort
+    the whole run instead of skipping the chunk — POSTing the remaining ~24 MB
+    chunks to an endpoint that just said it won't serve for hours defeats the
+    ceiling's entire purpose.
+    """
+
+
+def _long_audio_refusal(minutes: float, backend: str) -> LongAudioRefusal:
+    per_minute = _APPROX_USD_PER_MINUTE.get(backend, 0.006)
+    est_chunks = max(1, math.ceil(minutes * 60 * 8000 / MAX_UPLOAD_BYTES))
+    return LongAudioRefusal(
+        f"Whisper upload guard: ~{minutes:.0f} minutes of audio would be "
+        f"uploaded to {backend} (~{est_chunks} chunk(s), roughly "
+        f"${minutes * per_minute:.2f} at {backend} list rates). "
+        "Re-run with --transcribe-anyway to proceed, --start/--end to "
+        "transcribe a section, or --no-whisper to skip transcription."
+    )
+
+
 def plan_chunks(
     total_seconds: float,
     total_bytes: int,
@@ -368,7 +390,7 @@ def _post_whisper(endpoint: str, api_key: str, model: str, audio_path: Path) -> 
                     raise SystemExit(f"Whisper request failed: {exc}{detail}")
                 retry_after = _retry_after(exc)
                 if retry_after is not None and retry_after > RETRY_AFTER_CEILING:
-                    raise SystemExit(
+                    raise QuotaExhausted(
                         f"Whisper request failed: {exc}{detail} — the server asked to "
                         f"retry after {retry_after:.0f}s (~{retry_after / 60:.0f} min), "
                         f"over the {RETRY_AFTER_CEILING:.0f}s ceiling. That is quota "
@@ -486,6 +508,11 @@ def transcribe_chunks(
     for index, (path, offset) in enumerate(chunks):
         try:
             chunk_segments = transcribe_one(path)
+        except QuotaExhausted:
+            # Not a per-chunk hiccup: the server named a multi-minute wait, so
+            # every remaining chunk would meet the same refusal. Abort the run
+            # with the server's message instead of paying to find out N times.
+            raise
         except SystemExit as exc:
             failures += 1
             print(
@@ -585,15 +612,7 @@ def transcribe_video(
                 file=sys.stderr,
             )
         elif not allow_long:
-            per_minute = _APPROX_USD_PER_MINUTE.get(backend, 0.006)
-            est_chunks = max(1, math.ceil(estimated_seconds * 8000 / MAX_UPLOAD_BYTES))
-            raise LongAudioRefusal(
-                f"Whisper upload guard: ~{minutes:.0f} minutes of audio would be "
-                f"uploaded to {backend} (~{est_chunks} chunk(s), roughly "
-                f"${minutes * per_minute:.2f} at {backend} list rates). "
-                "Re-run with --transcribe-anyway to proceed, --start/--end to "
-                "transcribe a section, or --no-whisper to skip transcription."
-            )
+            raise _long_audio_refusal(minutes, backend)
 
     scope = (
         f" over {start_seconds or 0:.1f}-{end_seconds:.1f}s" if end_seconds is not None
@@ -604,6 +623,22 @@ def transcribe_video(
         video_path, audio_out, start_seconds=start_seconds, end_seconds=end_seconds
     )
     audio_bytes = audio_path.stat().st_size
+
+    # The authoritative guard, AFTER the encode: the pre-encode estimate reads
+    # the container's duration header, which headerless sources (piped output,
+    # OBS/browser recordings — long captionless recordings being the guard's
+    # exact target) simply do not have, silently bypassing it. The encoded mp3
+    # always has a real duration, and the expensive parts — upload and billing —
+    # have not happened yet.
+    if backend != "custom" and not allow_long:
+        try:
+            encoded_seconds = audio_duration(audio_path)
+        except SystemExit:
+            # A failed probe must not kill a run the guard exists to protect;
+            # the pre-encode estimate above already had its chance.
+            encoded_seconds = 0.0
+        if encoded_seconds > WHISPER_GUARD_SECONDS:
+            raise _long_audio_refusal(encoded_seconds / 60.0, backend)
 
     def transcribe_one(path: Path) -> list[dict]:
         return _transcribe_file(backend, api_key, path)

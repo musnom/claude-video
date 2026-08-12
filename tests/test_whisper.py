@@ -407,13 +407,23 @@ def test_non_numeric_retry_after_parses_to_none():
 
 
 def _stub_transcription(monkeypatch, tmp_path, source_seconds: float):
-    monkeypatch.setattr(whisper, "audio_duration", lambda p: source_seconds)
     audio = tmp_path / "a.mp3"
+    clip = {"seconds": source_seconds}
 
     def fake_extract(video_path, out_path, start_seconds=None, end_seconds=None):
+        # Mirror the real encoder: the mp3's duration is the window's, so the
+        # post-encode guard sees the clip length, not the source length.
+        if end_seconds is not None:
+            clip["seconds"] = max(0.0, end_seconds - (start_seconds or 0.0))
+        elif start_seconds:
+            clip["seconds"] = max(0.0, source_seconds - start_seconds)
         audio.write_bytes(b"x" * 100)
         return audio
 
+    def fake_duration(path):
+        return clip["seconds"] if str(path) == str(audio) else source_seconds
+
+    monkeypatch.setattr(whisper, "audio_duration", fake_duration)
     monkeypatch.setattr(whisper, "extract_audio", fake_extract)
     monkeypatch.setattr(
         whisper, "_transcribe_file",
@@ -473,3 +483,43 @@ def test_refusal_subclasses_systemexit():
     """Existing `except SystemExit` call sites must keep working; watch.py
     catches the subclass FIRST to report the honest reason."""
     assert issubclass(whisper.LongAudioRefusal, SystemExit)
+
+
+def test_guard_holds_when_the_container_reports_no_duration(monkeypatch, tmp_path):
+    """Headerless sources (piped output, OBS recordings) return duration 0 from
+    the pre-encode probe, which used to bypass the guard entirely. The
+    post-encode check reads the mp3's real duration and still refuses."""
+    audio = tmp_path / "a.mp3"
+    durations = {}
+
+    def fake_duration(path):
+        # The video container reports nothing; the encoded mp3 reports 2 hours.
+        return 0.0 if str(path).endswith(".mp4") else 2 * 3600.0
+
+    def fake_extract(video_path, out_path, start_seconds=None, end_seconds=None):
+        audio.write_bytes(b"x" * 100)
+        return audio
+
+    monkeypatch.setattr(whisper, "audio_duration", fake_duration)
+    monkeypatch.setattr(whisper, "extract_audio", fake_extract)
+    monkeypatch.setattr(
+        whisper, "_transcribe_file",
+        lambda backend, key, path: [{"start": 0.0, "end": 1.0, "text": "hi"}],
+    )
+    with pytest.raises(whisper.LongAudioRefusal, match="--transcribe-anyway"):
+        whisper.transcribe_video("v.mp4", audio, backend="groq", api_key="k")
+
+
+def test_quota_exhaustion_aborts_the_whole_chunked_run():
+    """A ceiling-exceeding 429 is not a per-chunk hiccup: the remaining ~24MB
+    chunks must NOT be posted to an endpoint that just said 'hours'."""
+    chunks = [(Path("a.mp3"), 0.0), (Path("b.mp3"), 100.0), (Path("c.mp3"), 200.0)]
+    attempted: list[str] = []
+
+    def transcribe_one(path: Path) -> list[dict]:
+        attempted.append(path.stem)
+        raise whisper.QuotaExhausted("server asked for 7200s")
+
+    with pytest.raises(whisper.QuotaExhausted):
+        whisper.transcribe_chunks(chunks, transcribe_one)
+    assert attempted == ["a"], "remaining chunks were still uploaded"

@@ -1693,15 +1693,20 @@ def _fill_time_gaps(
     decoded back in at the midpoints of the very holes dedup had just emptied.
     So each fill is now checked with the production dedup rule (*if dedup would
     have deleted this frame, don't create it*): a fill that near-duplicates ANY
-    known neighbour is unlinked and its hole retired. Any-side rather than
-    both-sides is load-bearing — an interior hole runs from one shot's first
-    frame to the *next* shot's first frame, so on a static shot the midpoint
-    always matches the left bound while differing from the right; a both-sides
-    rule would keep a duplicate at every bisection level of every static hole.
-    A frame matching either bound adds nothing the reader does not already have
-    from that bound. The rescue-from-collapse case (screen recordings whose
-    content evolves between look-alike shots) passes the check by construction —
-    an evolving midpoint differs from both bounds — and is unaffected.
+    known bound is unlinked — a copy of a bound adds nothing the reader does not
+    already have from that bound. Any-side rather than both-sides is
+    load-bearing: an interior hole runs from one shot's first frame to the
+    *next* shot's first frame, so on a static shot the midpoint always matches
+    the left bound while differing from the right, and a both-sides rule would
+    keep a duplicate at every bisection level of every static hole.
+
+    Rejecting the *frame* does not retire the whole *hole*, though. A sub-hole
+    is retired only when the probe proved it static — its far bound is known and
+    matches the probe. A sub-hole whose far bound is unknown (the trailing hole)
+    or different may still contain the change, so it is re-queued with the
+    probe's thumbnail as its new bound: content that appears mid-way through a
+    long static tail (the screen-recording rescue case) is found by that
+    narrowing instead of being lost to the first gray probe.
 
     The check runs *after* the decode because a frame's content cannot be known
     before decoding it; the incremental widest-hole structure is what bounds the
@@ -1770,19 +1775,33 @@ def _fill_time_gaps(
             got = _thumb_frames([path])
             new_thumb = got[0] if got else None
         if new_thumb is not None:
-            duplicate = any(
-                _is_near_duplicate(new_thumb, t, DEDUP_THRESHOLD, DEDUP_PEAK_THRESHOLD)
-                for t in (th0, th1) if t is not None
+            dup_left = th0 is not None and _is_near_duplicate(
+                new_thumb, th0, DEDUP_THRESHOLD, DEDUP_PEAK_THRESHOLD
+            )
+            dup_right = th1 is not None and _is_near_duplicate(
+                new_thumb, th1, DEDUP_THRESHOLD, DEDUP_PEAK_THRESHOLD
             )
             # A blank fill (mid-black-tail probe) is as worthless as a duplicate
             # one, and without this it would differ from its non-black neighbour
             # and reintroduce the end card _drop_trailing_blanks just removed.
-            if duplicate or _is_blank_thumb(new_thumb):
+            blank = _is_blank_thumb(new_thumb)
+            if dup_left or dup_right or blank:
                 try:
                     path.unlink()
                 except OSError:
                     pass
                 fill_meta["rejected"] += 1
+                # The frame is redundant, but only the sub-hole it PROVED
+                # static gets retired. The other side — far bound unknown or
+                # different — may hold the change; re-queue it with the probe's
+                # thumb as its bound, so the search narrows toward the change
+                # instead of abandoning it. Blank probes retire both sides:
+                # they sit inside a black tail the blank filter exists to drop.
+                if not blank:
+                    if not dup_left:
+                        holes.append((t0, middle, th0, new_thumb))
+                    if not dup_right:
+                        holes.append((middle, t1, new_thumb, th1))
                 continue
         fills.append({
             "index": 0,

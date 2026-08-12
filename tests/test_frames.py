@@ -272,7 +272,9 @@ def test_gap_fill_stops_early_on_static_shots(sparse_cuts_clip: Path, tmp_path: 
     )
     assert meta["engine"] == "scene"
     assert meta["gap_fill_rejected"] > 0
-    assert meta["gap_fill_stop"] == "saturated"
+    # Either non-budget stop is the honest outcome here: holes retired as
+    # static ("saturated") or narrowed under the 2s floor ("min-gap").
+    assert meta["gap_fill_stop"] in ("saturated", "min-gap")
     assert meta["gap_filled"] == 0
     assert len(out) == 12
     scene_frames = [f for f in out if f["reason"] in ("first-frame", "scene-change")]
@@ -918,3 +920,77 @@ def test_explicit_max_frames_at_full_resolution_on_4k_exceeds_the_hard_ceiling()
     # stays under it and is permitted.
     _, _, sane = frames.motion_token_estimate(35.0, 60.0, 2000, 1920, 1080, 512, None)
     assert sane < frames.MOTION_TOKEN_HARD_CEILING
+
+
+def test_gap_fill_probes_past_a_one_sided_duplicate(monkeypatch, tmp_path: Path):
+    """The trailing-hole rescue, pinned: a probe matching the only known bound
+    must not retire the unexplored half. Content appearing mid-way through a
+    long static tail — a box at t=7 on a gray screen — is exactly what
+    gap-fill exists to find, and the first rejection rule lost it."""
+    times: dict[str, float] = {}
+
+    def fake_decode(video_path, t, path, resolution, crop):
+        Path(path).write_bytes(b"jpg")
+        times[str(path)] = t
+        return True, ""
+
+    gray = bytes([100] * (frames.DEDUP_THUMB * frames.DEDUP_THUMB))
+    white = bytes([250] * (frames.DEDUP_THUMB * frames.DEDUP_THUMB))
+
+    def fake_thumbs(paths):
+        return [white if times.get(str(p), 0.0) >= 7.0 else gray for p in paths]
+
+    monkeypatch.setattr(frames, "_decode_frame_at", fake_decode)
+    monkeypatch.setattr(frames, "_thumb_frames", fake_thumbs)
+    selected = _selected_at(tmp_path, [0.5])
+    out, meta = frames._fill_time_gaps(
+        "v.mp4", tmp_path, selected, budget=6, resolution=512, crop=None,
+        window_end=10.0, dedup=True,
+    )
+    kept = [f["timestamp_seconds"] for f in out if f["reason"] == "gap-fill"]
+    assert any(t >= 7.0 for t in kept), (kept, meta)
+    assert meta["rejected"] >= 1  # the gray probes were still redundant frames
+
+
+def test_static_hole_between_known_bounds_is_retired_without_keeping_frames(
+    monkeypatch, tmp_path: Path
+):
+    """The other direction: bounds known and matching on both sides of every
+    probe -> no frames kept, holes retired (the 89%-padding fix must survive
+    the one-sided re-queue rule)."""
+    _fake_decode(monkeypatch)
+    flat = bytes([100] * (frames.DEDUP_THUMB * frames.DEDUP_THUMB))
+    monkeypatch.setattr(frames, "_thumb_frames", lambda paths: [flat] * len(paths))
+    selected = _selected_at(tmp_path, [0.0, 100.0])
+    out, meta = frames._fill_time_gaps(
+        "v.mp4", tmp_path, selected, budget=10, resolution=512, crop=None,
+        window_end=100.0, dedup=True,
+    )
+    assert meta["filled"] == 0
+    assert meta["stop"] == "saturated"
+    assert len(out) == 2
+
+
+def test_estimated_stamps_are_excluded_from_shot_stats_in_production(
+    monkeypatch, tmp_path: Path
+):
+    """The caller-side filter in extract_scene_or_uniform, exercised directly:
+    fabricated (estimated) stamps must not enter the shot statistics."""
+    cands = _selected_at(tmp_path, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0])
+    for frame in cands[6:]:
+        frame["estimated"] = True
+        frame["timestamp_seconds"] = 5.0  # the fabricated copy of the last stamp
+    monkeypatch.setattr(frames, "extract_scene_candidates", lambda *a, **k: list(cands))
+    monkeypatch.setattr(
+        frames, "_fill_time_gaps",
+        lambda video_path, out_dir, selected, budget, **k: (
+            selected, {"filled": 0, "rejected": 0, "failed": 0, "stop": None}
+        ),
+    )
+    _out, meta = frames.extract_scene_or_uniform(
+        "v.mp4", tmp_path, fps=1.0, target_frames=10, max_frames=10,
+        dedup=False, full_duration=10.0,
+    )
+    # 6 measured stamps (0..5) -> 5 cuts. With the fabrications included the
+    # count would read 7.
+    assert meta["shots"]["cuts"] == 5

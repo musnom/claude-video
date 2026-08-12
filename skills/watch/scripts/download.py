@@ -22,7 +22,12 @@ VIDEO_EXTS = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".wmv"}
 
 # Stderr substrings that identify YouTube's 403 / SABR-style blocking. Case-
 # insensitive; pinned as a constant so the retry and the classifier agree.
-_SIG_403 = ("http error 403", "403: forbidden", "sabr")
+# Deliberately NOT the bare word "sabr": yt-dlp prints an advisory "SABR-only
+# streaming experiment" *warning* on runs that still succeed with other
+# formats, and matching it would fire the android retry — and report an HTTP
+# 403 that never happened — on any unrelated failure sharing that stderr.
+# Actual SABR blocking always surfaces as an HTTP 403.
+_SIG_403 = ("http error 403", "403: forbidden")
 
 # yt-dlp versions are CalVer (YYYY.MM.DD), so staleness is readable off the
 # version string with no network call. 90 days: yt-dlp ships every 2-6 weeks
@@ -224,10 +229,21 @@ def _matches_403(stderr_text: str) -> bool:
     return any(sig in low for sig in _SIG_403)
 
 
+# No bare "cookies" entry: yt-dlp mentions cookies in advisory lines on
+# non-login failures — including "Skipping client "android" since it does not
+# support cookies", which this module's OWN retry provokes when the user passed
+# --cookies-from-browser — so that substring would route 403s to login advice.
+_LIVE_REFUSAL = (
+    "This URL is a live broadcast. yt-dlp would record it until it ends, "
+    "which for an ongoing stream means /watch never returns.\n"
+    "Re-run once the stream has finished — the same URL then resolves to "
+    "a normal recording."
+)
+
 _LOGIN_SIGS = (
     "sign in to confirm", "age-restricted", "age restricted", "private video",
     "members-only", "members only", "login required", "join this channel",
-    "cookies", "confirm your age",
+    "confirm your age",
 )
 _REGION_SIGS = (
     "not available in your country", "geo restrict",
@@ -261,14 +277,10 @@ def _classify_download_failure(
             "help — it needs a different source or region."
         )
     if "does not pass filter" in low and "is_live" in low:
-        # The --match-filter guard fired: same message the pre-download check
-        # prints when the metadata fetch succeeds.
-        return (
-            "This URL is a live broadcast. yt-dlp would record it until it ends, "
-            "which for an ongoing stream means /watch never returns.\n"
-            "Re-run once the stream has finished — the same URL then resolves to "
-            "a normal recording."
-        )
+        # Belt only: yt-dlp writes the filter-skip line to STDOUT, which is not
+        # captured, so this branch rarely sees it. The primary live detection
+        # after a failed download is download_url's info.json check.
+        return _LIVE_REFUSAL
     if _matches_403(stderr_text):
         version = _ytdlp_version()
         age = _ytdlp_age_days(version, datetime.date.today())
@@ -337,12 +349,21 @@ def _pick_subtitle(out_dir: Path, sub_langs: str = SUB_LANGS) -> Path | None:
     return candidates[0]
 
 
+# yt-dlp downloads merged formats leg by leg as video.fNNN.<ext> and keeps a
+# finished leg for resume when the other leg fails. Such a file is NOT a
+# successful download: counting it as one both skipped the 403 retry (the
+# failure that stranded it) and returned a video-only file whose silence
+# downstream reads as "this source has no audio".
+_FORMAT_LEG_RE = re.compile(r"^video\.f\d+\.")
+
+
 def _pick_video(out_dir: Path) -> Path | None:
     for ext in (".mp4", ".mkv", ".webm", ".mov", ".m4a", ".mp3", ".opus"):
         for candidate in out_dir.glob(f"video*{ext}"):
-            return candidate
+            if not _FORMAT_LEG_RE.match(candidate.name):
+                return candidate
     for candidate in out_dir.glob("video.*"):
-        if candidate.suffix.lower() in VIDEO_EXTS:
+        if candidate.suffix.lower() in VIDEO_EXTS and not _FORMAT_LEG_RE.match(candidate.name):
             return candidate
     return None
 
@@ -510,6 +531,12 @@ def download_url(
         video = _pick_video(out_dir)
         retried_android = True
     if video is None:
+        # Live detection reads the info JSON rather than stderr: the
+        # --match-filter skip message goes to yt-dlp's STDOUT, which streams to
+        # the user but is not captured, so the classifier cannot see it.
+        failed_info = _read_info(out_dir / "video.info.json", url)
+        if failed_info.get("is_live") or failed_info.get("live_status") == "is_live":
+            raise SystemExit(_LIVE_REFUSAL)
         raise SystemExit(
             _classify_download_failure(stderr_text, returncode, out_dir, retried_android)
         )

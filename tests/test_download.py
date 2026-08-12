@@ -508,3 +508,96 @@ exit 0
     err = capfd.readouterr().err
     assert "retrying once with the Android player client" in err
     assert "HTTP Error 403" in err, "the tee did not forward the child's stderr"
+
+
+def test_persistent_403_stops_after_exactly_one_retry(monkeypatch, tmp_path):
+    """SABR blocking both attempts: the run must make exactly two yt-dlp calls
+    (original + one android retry) and then fail classified — a regression that
+    loops clients would hammer YouTube while the suite stayed green."""
+    calls = _capture_argv(
+        monkeypatch, rc=1, stderr_text="ERROR: HTTP Error 403: Forbidden"
+    )
+    monkeypatch.setattr(download.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(download, "_ytdlp_version", lambda: "2026.01.01")
+    with pytest.raises(SystemExit, match="Android player client was already attempted"):
+        download.download_url(URL, tmp_path)
+    assert len(calls) == 2
+
+
+def test_pick_video_skips_format_leg_files(tmp_path):
+    """A stranded per-format leg (video.f398.mp4, kept by yt-dlp for resume
+    when the other leg 403s) is NOT a successful download — counting it as one
+    both skipped the retry and shipped a silent video-only file."""
+    (tmp_path / "video.f398.mp4").write_bytes(b"x")
+    assert download._pick_video(tmp_path) is None
+    (tmp_path / "video.mp4").write_bytes(b"x")
+    assert download._pick_video(tmp_path).name == "video.mp4"
+
+
+def test_stranded_leg_still_triggers_the_android_retry(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_stream(cmd):
+        calls.append(list(cmd))
+        if len(calls) == 1:
+            (tmp_path / "video.f398.mp4").write_bytes(b"x")   # stranded video leg
+        else:
+            (tmp_path / "video.mp4").write_bytes(b"x")        # merged retry result
+        return 1, "ERROR: HTTP Error 403: Forbidden"
+
+    monkeypatch.setattr(download, "_stream_ytdlp", fake_stream)
+    monkeypatch.setattr(download, "_warn_if_stale_ytdlp", lambda: None)
+    monkeypatch.setattr(download.shutil, "which", lambda name: f"/usr/bin/{name}")
+    result = download.download_url(URL, tmp_path)
+    assert len(calls) == 2
+    assert result["video_path"].endswith("video.mp4")
+
+
+def test_failed_download_of_a_live_url_is_classified_from_info_json(monkeypatch, tmp_path):
+    """yt-dlp's filter-skip line goes to STDOUT (uncaptured), so live detection
+    after a failed download reads the info JSON instead of stderr."""
+    import json as _json
+
+    def fake_stream(cmd):
+        (tmp_path / "video.info.json").write_text(
+            _json.dumps({"title": "Live", "is_live": True, "live_status": "is_live"}),
+            encoding="utf-8",
+        )
+        return 0, ""
+
+    monkeypatch.setattr(download, "_stream_ytdlp", fake_stream)
+    monkeypatch.setattr(download, "_warn_if_stale_ytdlp", lambda: None)
+    monkeypatch.setattr(download.shutil, "which", lambda name: f"/usr/bin/{name}")
+    with pytest.raises(SystemExit, match="live broadcast"):
+        download.download_url(URL, tmp_path)
+
+
+def test_advisory_sabr_warning_alone_does_not_classify_as_403(monkeypatch, tmp_path):
+    """yt-dlp prints a 'SABR-only streaming experiment' WARNING on runs that
+    can still succeed; the word alone must trigger neither the android retry
+    nor a fabricated 'HTTP 403' verdict."""
+    calls = _capture_argv(
+        monkeypatch, rc=1,
+        stderr_text="WARNING: Some web client https formats have been skipped — "
+                    "YouTube may have enabled the SABR-only streaming experiment\n"
+                    "ERROR: This video is unavailable",
+    )
+    monkeypatch.setattr(download.shutil, "which", lambda name: f"/usr/bin/{name}")
+    with pytest.raises(SystemExit) as exc:
+        download.download_url(URL, tmp_path)
+    assert len(calls) == 1, "the advisory warning fired the android retry"
+    assert "SABR-style" not in str(exc.value)
+
+
+def test_cookie_advisory_lines_do_not_classify_as_login_wall(monkeypatch):
+    """The android retry itself provokes 'Skipping client "android" since it
+    does not support cookies' when the user passed --cookies-from-browser; the
+    word must not route a 403 to login advice."""
+    monkeypatch.setattr(download, "_ytdlp_version", lambda: "2026.01.01")
+    message = download._classify_download_failure(
+        'Skipping client "android" since it does not support cookies\n'
+        "ERROR: HTTP Error 403: Forbidden",
+        1, Path("/tmp/x"), retried_android=True,
+    )
+    assert "403" in message
+    assert "login-walled" not in message

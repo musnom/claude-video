@@ -114,10 +114,16 @@ def _read_env_key(name: str, include_cwd: bool = True) -> str | None:
     """One parser AND one path list for the whole codebase (config.read_setting:
     env → ~/.config/watch/.env → ./.env). This used to read only the config
     file, so a project-local GROQ_API_KEY transcribed fine (whisper.py always
-    honored ./.env) while --check reported needs_key and the hook nagged."""
-    for path in env_file_paths(include_cwd):
-        if path.exists():
-            _check_file_permissions(path)
+    honored ./.env) while --check reported needs_key and the hook nagged.
+
+    Permissions are checked on the machine config only. A project ``./.env`` is
+    routinely 0644 and usually not ours at all (a web app's DATABASE_URL file);
+    warning about it on every --check broke the silent-on-success contract for
+    anyone whose repo merely contains a .env.
+    """
+    machine_config = env_file_paths(include_cwd=False)[0]
+    if machine_config.exists():
+        _check_file_permissions(machine_config)
     return read_setting(name, include_cwd=include_cwd)
 
 
@@ -169,17 +175,29 @@ def _write_setup_complete() -> None:
     detect this marker to skip wizard-style UI and stay silent.
     """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    existing = ""
     if CONFIG_FILE.exists():
         # Decode defensively, then rewrite as UTF-8 — this self-heals a file
         # PowerShell or Notepad wrote in UTF-16/BOM form.
         existing = decode_env_bytes(CONFIG_FILE.read_bytes(), CONFIG_FILE)
-        for line in existing.splitlines():
-            if line.strip().startswith("SETUP_COMPLETE="):
-                return
-        if existing and not existing.endswith("\n"):
-            existing += "\n"
-        CONFIG_FILE.write_text(existing + "SETUP_COMPLETE=true\n", encoding="utf-8")
+        lines = existing.splitlines()
+        rewritten = False
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("export "):
+                stripped = stripped[7:].lstrip()
+            if stripped.startswith("SETUP_COMPLETE="):
+                if stripped == "SETUP_COMPLETE=true":
+                    return
+                # A non-true line (SETUP_COMPLETE=false, or blank) used to
+                # trigger the idempotency early-return: the command printed
+                # "recorded: setup complete", wrote nothing, and the hook kept
+                # nagging forever. Rewrite the line instead.
+                lines[i] = "SETUP_COMPLETE=true"
+                rewritten = True
+                break
+        if not rewritten:
+            lines.append("SETUP_COMPLETE=true")
+        CONFIG_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
     else:
         CONFIG_FILE.write_text(ENV_TEMPLATE + "\nSETUP_COMPLETE=true\n", encoding="utf-8")
     try:
@@ -309,7 +327,11 @@ def cmd_check() -> int:
     )
     sys.stderr.flush()
 
-    if s["missing_binaries"] and not s["has_api_key"]:
+    # Exit 4 ("both missing") only before setup was ever completed: a user who
+    # deliberately recorded a keyless setup and later lost a binary is a
+    # binary-regression (2), and the documented remediation for 4 would re-ask
+    # the transcription question they already declined.
+    if s["missing_binaries"] and not s["has_api_key"] and not s["setup_complete"]:
         return 4
     if s["missing_binaries"]:
         return 2

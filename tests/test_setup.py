@@ -158,3 +158,28 @@ def test_complete_is_idempotent(tmp_path):
     _run(["--complete"], home=tmp_path)
     body = (tmp_path / ".config" / "watch" / ".env").read_text(encoding="utf-8")
     assert body.count("SETUP_COMPLETE=true") == 1
+
+
+def test_complete_rewrites_a_non_true_marker(tmp_path):
+    """SETUP_COMPLETE=false (a plausible hand-edit) used to early-return the
+    writer while --complete still printed 'recorded: setup complete' — the
+    exact nag-forever failure the command was built to end, behind a false
+    success message."""
+    _write_env(tmp_path, "GROQ_API_KEY=\nSETUP_COMPLETE=false\n")
+    proc = _run(["--complete"], home=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    body = (tmp_path / ".config" / "watch" / ".env").read_text(encoding="utf-8")
+    assert body.count("SETUP_COMPLETE=true") == 1
+    assert "SETUP_COMPLETE=false" not in body
+    js = json.loads(_run(["--json"], home=tmp_path).stdout)
+    assert js["setup_complete"] is True
+
+
+def test_binary_regression_after_keyless_complete_exits_2_not_4(tmp_path):
+    """Exit 4's documented remediation re-asks the transcription question; a
+    user who recorded a deliberate keyless setup and later lost a binary is a
+    plain binary regression (2)."""
+    _run(["--complete"], home=tmp_path)
+    env_extra = {"PATH": "/nonexistent"}
+    proc = _run(["--check"], home=tmp_path, extra_env=env_extra)
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
