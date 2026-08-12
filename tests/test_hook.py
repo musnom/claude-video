@@ -253,3 +253,25 @@ def test_remediation_hint_names_a_real_path(tmp_path):
     match = re.search(r"`python3 (\S+/setup\.py)`", result.stdout)
     assert match, result.stdout
     assert Path(match.group(1)).is_file(), match.group(1)
+
+
+def test_hooks_json_points_at_the_script_this_suite_tests():
+    """A manifest typo silently disables the hook on every install while all
+    the script tests above stay green."""
+    import json
+    import shlex
+
+    repo_root = HOOK.parent.parent.parent
+    manifest = json.loads((repo_root / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    entries = manifest["hooks"]["SessionStart"]
+    commands = [
+        h["command"]
+        for entry in entries
+        for h in entry["hooks"]
+        if h.get("type") == "command"
+    ]
+    assert len(commands) == 1, manifest
+    resolved = commands[0].replace("${CLAUDE_PLUGIN_ROOT}", str(repo_root))
+    script = Path(shlex.split(resolved)[-1])
+    assert script == HOOK
+    assert script.is_file()

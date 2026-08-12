@@ -2,6 +2,111 @@
 
 All notable changes to `/watch` are documented here.
 
+## [0.5.0] — 2026-08-11
+
+The close-the-gaps release: a full audit of the pipeline (recorded at commit `7db0aba`,
+where the audit snapshots live in history) followed by fixes for everything it found.
+
+### Added
+- **YouTube download resilience.** yt-dlp's stderr is captured and *classified*: a login
+  wall / age gate routes to `--cookies-from-browser` (with consent), a region lock says
+  cookies won't help, and an HTTP 403 (SABR-style blocking) triggers exactly one automatic
+  retry with the Android player client — media only; captions are already fetched. A stale
+  yt-dlp (>90 days old by its CalVer version, no network call needed) warns with the
+  platform's upgrade command before the download starts, since it is the most common cause
+  of the whole failure class.
+- **Playlist/channel URLs are refused** with the actual fix ("pass one video's URL")
+  instead of downloading an arbitrary entry over the shared output file; the metadata pass
+  is bounded to one entry so the refusal comes in seconds.
+- **A cloud-transcription cost guard.** A captionless source over ~60 minutes of audio is
+  refused *before* the encode, with the minute count and rough cost; `--transcribe-anyway`
+  proceeds after the user agrees. Self-hosted endpoints are exempt. Relatedly, a 429 whose
+  server-requested wait exceeds 60 s fails fast naming the wait instead of sleeping through
+  a multi-hour quota window.
+- **`--sub-langs` / `WATCH_SUB_LANGS`** override the caption request for regional variants
+  (`en-CA`) and non-English tracks without an `-orig` variant — and the requested variant is
+  *selected*, not merely fetched. The default (which measured better than upstream's `en.*`)
+  is unchanged.
+- **`--scene-threshold`** to tune cut detection (default 0.05; scene modes only), and
+  **`--cookies` / `--cookies-from-browser`** (opt-in, never automatic) for login-walled
+  videos — both landed after 0.4.0's entry was written.
+- **Live broadcasts are refused before download** with a clear re-run-later message — and a
+  `--match-filter` belt refuses them at download time even when the metadata fetch failed,
+  so a live URL can no longer make the run record until the stream ends.
+- **A trailing blank-frame filter**: a solid-black end card no longer spends an image slot;
+  mid-video fades and dark scenes are untouched. Reported in the Frames line.
+- **`setup.py --complete`** records a deliberate keyless setup, making "never nagged again"
+  true without hand-editing the config; the first-run flow now offers the self-hosted
+  `WATCH_WHISPER_ENDPOINT` alongside Groq/OpenAI, and declining transcription is a
+  first-class option.
+- **`references/setup.md`**: the full first-run/remediation flow, read only when the
+  preflight says so — the always-read SKILL.md is ~50 lines shorter for it.
+- **Focused Whisper uploads**: `--start`/`--end` runs encode and upload only the window's
+  audio (measured 4689 kB → ~156 kB on a 10-minute clip with a 20 s window).
+- **The Shots line**: full detected-cut pacing statistics (cuts/min, shot-length
+  percentiles) computed independently of the frame cap, printed as the explicit lower
+  bound it is — `at least N cuts (detected at scene threshold T)`.
+
+### Fixed
+- **`token-burner` can no longer cover less than `balanced`.** The uncapped mode gap-filled
+  toward the duration target (40–80 frames on a 1–10-minute clip) while balanced filled
+  toward its 100-frame cap; it now fills toward at least balanced's coverage. The guard
+  test that masked this could not fail by construction and was rebuilt under production
+  conditions.
+- **Gap-fill no longer pads with near-duplicates.** Fills are checked against their
+  neighbouring frames with the production dedup rule and filling stops when candidates stop
+  being distinct. Measured on a 300 s static-shot clip: 100 frames (11 distinct, 89%
+  duplicates) → the 11 distinct frames, with `fill stopped early: N near-duplicate
+  candidates rejected` in the report. Fill decode failures are counted, not swallowed.
+- **`--fps` is bounded and honest.** Non-positive values are rejected (they used to make
+  the sampler select *every* decoded frame — ~18,000 JPEGs on a 10-minute clip); clamping
+  above 2 fps prints both numbers; the report states the effective rate whenever the flag
+  governed sampling.
+- **`--end` past the end of the video is clamped with a note** instead of budgeting frames
+  against a phantom duration (which silently made focused runs *sparser* than full runs);
+  a bare `--end 0` is rejected instead of producing an empty report.
+- **Timestamp fabrication is disclosed.** When ffmpeg reports fewer measured timestamps
+  than frames, the extras are marked `estimated`, excluded from shot statistics, and the
+  report says so — they no longer collapse silently onto the window start.
+- **The motion token guard cannot be bypassed.** The cost estimate prints before every
+  `--motion` extraction, and an absolute 600k-token ceiling holds even with an explicit
+  `--max-frames` (2000 frames at the default 512px stays permitted; `--resolution 1998` on
+  a 4K source — ~6M image tokens — is refused).
+- **One `.env` truth.** Settings resolve as env → `~/.config/watch/.env` → `./.env` for
+  *every* consumer (config, whisper, setup, and the session hook), so a project-local key
+  no longer transcribes fine while `--check` reports `needs_key`. `export KEY=` lines
+  parse; values containing `=` survive the hook; `SETUP_COMPLETE` is machine-config only,
+  so a cloned repo cannot suppress another user's first run.
+- **The session hook stops spamming**: no more `/watch: ready.` on every session for users
+  whose key lives in the shell profile, self-hosted endpoints count as configured, and the
+  remediation hint prints a real path instead of a literal `$CLAUDE_PLUGIN_ROOT`.
+- **Packaging ships only runtime files.** The claude.ai `.skill` bundle no longer includes
+  `build-skill.sh`/`.skillignore` (subtree archives resolve `export-ignore` relative to the
+  subtree, so the repo-root rules never applied), and the plugin archive no longer ships
+  dev planning docs. A release-level test pins both archives' contents.
+- **Releases are gated**: the `v*` tag workflow runs the full suite on macOS before
+  building and attaching `watch.skill`. Previously a tag published with zero verification.
+- Cue-frame and gap-fill decode failures, per-engine caps/budgets, and the effective
+  uniform rate are all reported; uniform-sampled frames carry measured timestamps
+  (landed after 0.4.0's entry: `effective_cap`/`budget` reporting and measured uniform
+  stamps).
+
+### Changed
+- **The skill description finally names what the skill can do** — motion/easing
+  measurement, editing-style and pacing analysis, screen recordings, audio files,
+  crop-for-legibility, transcript-only — so hosts can route those questions to `/watch`
+  autonomously. The same fix lands across `plugin.json`, the Codex manifest, and the
+  marketplace listing, plus their keywords.
+- The `**Shots:**` count is quoted as a lower bound with its detection threshold, in the
+  report and in both reference workflows.
+- `references/motion.md` ends in an answer with code in chat: the skill's tool contract
+  (`Bash, Read, AskUserQuestion`) deliberately excludes file editing, and applying
+  recreation code to a project goes through the host's normal tools.
+- Every ffmpeg invocation carries `-nostdin`, so a child can never eat the harness's stdin.
+- README: attribution reworked (maintained by Mustafa Nomair; forked from
+  bradautomates/claude-video by Brad Bonanno), stale pre-gap-fill claims replaced with the
+  current engine behavior, and the new flags documented.
+
 ## [0.4.0] — 2026-08-11
 
 ### Added

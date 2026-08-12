@@ -1,7 +1,7 @@
 ---
 name: watch
-version: "0.4.0"
-description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper API fallback), and hands the result to Claude so it can answer questions about what's in the video.
+version: "0.5.0"
+description: Watch and analyze a video, screen recording, or audio file — from a URL (YouTube, Vimeo, TikTok, X, Twitch, anything yt-dlp supports) or a local file. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, and pulls a timestamped transcript from native captions or the Whisper API, so answers come from what is actually on screen and in the audio. Also measures motion and animation timing — transition durations and easing curves via --motion — characterizes editing style and pacing (cuts per minute, shot lengths), crops regions so small on-screen text stays legible, and has a transcript-only mode. Use it when the user shares a video URL or file and asks what happens in it, wants a summary, is debugging a screen recording, asks how fast something moves or what easing an animation uses, wants an editing style characterized or matched, or needs an audio file transcribed.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
 homepage: https://github.com/mustafa-nom/claude-video
@@ -38,74 +38,25 @@ if [ ! -f "$SKILL_DIR/scripts/watch.py" ]; then
 fi
 ```
 
-## Step 0 — Setup preflight (runs every `/watch` invocation, silent on success)
+## Step 0 — Setup preflight (silent on success)
 
-**Python interpreter:** every `python3 ...` command in this skill is for macOS/Linux. On **Windows**, substitute `python` — the `python3` command on Windows is the Microsoft Store stub and will not run the script.
+**Windows:** substitute `python` for `python3` in every command in this skill (`python3` on Windows is the Microsoft Store stub and will not run the scripts).
 
-On the first `/watch` invocation in a session, use structured preflight so you can detect first-run setup:
+On the **first `/watch` of a session**, run the structured preflight:
 
 ```bash
 python3 "${SKILL_DIR}/scripts/setup.py" --json
 ```
 
-Branch on two fields:
+If `can_proceed` is `true` and `first_run` is `false`, setup is already done (the user may have deliberately skipped transcription — that's allowed) — proceed to Step 1 without comment. Anything else — `first_run: true` or `can_proceed: false` — read **`${SKILL_DIR}/references/setup.md`** and follow the first-run / remediation flow there before proceeding.
 
-- **`can_proceed: true` and `first_run: false`** → setup is already done (the user may have deliberately skipped a Whisper key — that's allowed). Proceed to Step 1 without comment.
-- **`first_run: true`** → genuine first-time setup. Do these in order:
-  1. If `missing_binaries` is non-empty, run the installer first (it auto-installs on macOS / prints commands elsewhere — see below) and confirm the binaries land. **Do not skip this and jump to preferences.**
-  2. Run the installer once more if needed so it scaffolds `~/.config/watch/.env` (it only writes the template when the file is absent, so let it create the file *before* you write any values into it).
-  3. Encourage a Whisper API key and ask the watch-preference questions below, then write the selected values into `~/.config/watch/.env` and set `SETUP_COMPLETE=true`.
-- **`can_proceed: false` and `first_run: false`** → setup was finished before but the environment regressed (e.g. `missing_binaries` after an OS change). Run the installer to remediate, then proceed. Don't re-ask preferences.
-
-A missing Whisper key is *encouraged to fix, not required*: on a genuine first run `status` will read `needs_key` even when binaries are present — that's your cue to encourage a key, not a blocker.
-
-On follow-up `/watch` calls in the same session, use the silent check:
+On **follow-up `/watch` calls** in the same session, use the silent check (<100ms):
 
 ```bash
 python3 "${SKILL_DIR}/scripts/setup.py" --check
 ```
 
-This is a <100ms lookup. Exit 0 means /watch can run — this **includes a user who finished setup without a Whisper key** (keyless is allowed). On exit 0 the script emits **nothing** — proceed to Step 1 without comment. **Do NOT announce "setup is complete" to the user** — they don't need a status message on every turn. The only acceptable user-visible output from Step 0 is when remediation is required.
-
-On non-zero exit, follow the table:
-
-| Exit | Meaning | Action |
-|------|---------|--------|
-| `2` | Missing binaries (`ffmpeg` / `ffprobe` / `yt-dlp`) | Run installer |
-| `3` | Genuine first run with no Whisper API key | Run installer to scaffold `.env`, then encourage a key (the user may decline — proceed with `--no-whisper`) |
-| `4` | Both missing | Run installer, then encourage a key |
-
-Exit `3` only fires before the user has completed setup. Once `SETUP_COMPLETE=true` is written, a keyless install returns exit 0 and is never nagged again.
-
-The installer is idempotent — safe to re-run:
-
-```bash
-python3 "${SKILL_DIR}/scripts/setup.py"
-```
-
-On macOS with Homebrew, it auto-installs `ffmpeg` and `yt-dlp`. On Linux/Windows, it prints the exact install commands for the user to run. It scaffolds `~/.config/watch/.env` with commented placeholders and default watch settings at `0600` perms.
-
-**If an API key is still missing after install:** use `AskUserQuestion` to ask the user whether they have a Groq API key (preferred — cheaper, faster) or an OpenAI key. Then write it into `~/.config/watch/.env` — set the matching `GROQ_API_KEY=...` or `OPENAI_API_KEY=...` line. If they don't want to set up Whisper, proceed with `--no-whisper` and tell them videos without native captions will come back frames-only.
-
-**First-run watch preference:** after the installer has scaffolded `~/.config/watch/.env`, use `AskUserQuestion` to ask one question:
-
-- Default detail (one dial). Present these as `AskUserQuestion` options in this exact order — lightest to heaviest — and keep `(recommended)` on `balanced` even though it is not first (do **not** reorder to put the recommended option first):
-  - `transcript` — no frames at all, transcript only (skips video download when captions exist).
-  - `efficient` — fast keyframe pass (cap 50).
-  - `balanced` (recommended) — scene-aware frames (cap 100, default).
-  - `token-burner` — scene-aware, uncapped (maximum fidelity; high token cost).
-
-Write the answer directly into `~/.config/watch/.env` by setting the bare key on its own line — **no trailing inline comment** (a `# note` after the value can break parsing):
-
-```bash
-WATCH_DETAIL=balanced
-```
-
-Use the user's selected value. If they skip the question, keep the recommended default. Once dependencies, the API-key choice, and this preference are handled, write or update `SETUP_COMPLETE=true` in the same file. Do not ask this preference question again when `SETUP_COMPLETE=true`.
-
-**Structured mode (optional):** `python3 "${SKILL_DIR}/scripts/setup.py" --json` emits `{status, can_proceed, first_run, setup_complete, missing_binaries, whisper_backend, has_api_key, config_file, watch_detail, platform}` where `status` is one of `ready | needs_install | needs_key | needs_install_and_key`. `status` describes the *ideal* state (a key is encouraged, so a keyless first run reads `needs_key`); `can_proceed` is the operational gate (binaries present AND a key is set OR setup was already completed). Branch on `can_proceed`/`first_run` to decide whether to run; use `status` to decide what to encourage.
-
-Within a single session, you can skip Step 0 on follow-up `/watch` calls — once `--check` returned 0, nothing about the environment changes between turns.
+Exit 0 emits nothing — proceed without comment, and do **NOT** announce "setup is complete"; the only acceptable user-visible output from Step 0 is when remediation is required. On a non-zero exit, read `references/setup.md` (the exit codes and their fixes live there). Once `--check` has returned 0 in a session you can skip Step 0 entirely on later calls — nothing about the environment changes between turns.
 
 ## When to use
 
@@ -123,13 +74,14 @@ Two workflows live outside this file because they need real detail and most runs
 |---|---|
 | `references/motion.md` | The question is about timing, movement, easing, or recreating an animation (`--motion`). |
 | `references/editing-style.md` | The question is about cutting rhythm, pacing, motion-graphics construction, or on-screen typography. |
+| `references/setup.md` | Step 0's preflight reported `first_run: true` or a non-zero `--check` exit. |
 
 Resolve them the same way as the scripts: `${SKILL_DIR}/references/<name>.md`.
 
 ## Recommended limits
 
 - **Best accuracy: videos under 10 minutes.** Frame coverage scales inversely with duration.
-- **Auto-mode rate cap: 2 fps.** The duration budget never samples faster than 2 fps, and `--fps` cannot raise it. This is a cap on *automatic* sampling — `--timestamps` grabs frames at whatever exact moments you name, with no rate limit.
+- **Auto-mode rate cap: 2 fps.** The duration budget never samples faster than 2 fps, and `--fps` cannot raise it (asking for more prints a clamp notice and samples at 2). This is a cap on *automatic* sampling — `--timestamps` grabs frames at whatever exact moments you name, with no rate limit between them, though cue frames still count against the detail-mode frame cap (they are reserved out of it first; see Step 3).
 - **The frame ceiling is set by the detail mode** (`WATCH_DETAIL` in `~/.config/watch/.env`, or `--detail`), not a single global cap:
   - `transcript` → no frames
   - `efficient` → up to **50** (keyframes)
@@ -165,6 +117,8 @@ Optional flags:
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
 - `--whisper groq|openai|custom` — force a specific Whisper backend (default: a self-hosted endpoint if `WATCH_WHISPER_ENDPOINT` is set, else Groq, else OpenAI)
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
+- `--transcribe-anyway` — proceed with a cloud Whisper upload past the ~60-minute duration guard. When a run is refused by that guard, relay the printed estimate to the user with `AskUserQuestion` and re-run with this flag only on a yes — it is their API bill.
+- `--sub-langs LIST` — override the caption languages requested from the source (also settable as `WATCH_SUB_LANGS` in the config). Use when a video's only track is a regional variant (`en-CA`, `en-IN`) or a non-English language with no `-orig` track. Prefer exact codes: broad regexes fan out across YouTube's dozens of auto-translated tracks and collect rate-limit rejections.
 - `--motion` — frame-by-frame motion/timing analysis. Samples the source's own frames (no resampling), labels each to the millisecond, never dedups, overrides `--detail`. **Read `references/motion.md` before using it.**
 - `--crop x,y,w,h` — crop to a region in **source** pixels before scaling. Two uses, both large: it makes a small UI component fill the frame so its position is measurable, and it is the only way to make small on-screen **text legible** — a 512px frame scales a 1920px source by 3.75×, so 16px body text arrives 4.3px tall, below the ~8–10px floor where glyphs read at all. Costs fewer tokens, not more. Works in every mode.
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this when the user needs every sampled frame — judging subtle frame-to-frame motion, or measuring cutting rhythm.
@@ -299,15 +253,18 @@ All three settings live in `~/.config/watch/.env`. Override the automatic choice
 
 ## Failure modes and handling
 
-- **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
+- **Setup preflight failed** → read `references/setup.md` and follow its flow (installer, transcription question, preferences).
 - **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
-- **Download fails** → yt-dlp's error goes to stderr. If it is **login-required, age-gated or members-only**, tell the user plainly and offer `--cookies-from-browser chrome` (or their browser) as the fix — do not pass it without asking, and do not keep retrying. If it is region-locked, say so; cookies will not help.
-- **"This URL is a live broadcast"** → refused before downloading, because yt-dlp would record until the stream ends. Tell the user to re-run once it has finished; the same URL then resolves to a normal recording.
+- **Download fails** → the script *classifies* the failure on stderr — follow its message. **Login-walled / age-gated / members-only** → offer `--cookies-from-browser chrome` (or the user's browser); do not pass it without asking, and do not keep retrying. **Region-locked** → say so; cookies will not help. **HTTP 403 / SABR** → a retry with the Android player client already ran automatically; if the message names a stale yt-dlp, relay its upgrade command — that is the most common fix.
+- **"yt-dlp ... is N days old" warning** → an outdated yt-dlp is the top cause of YouTube failures. Relay the printed upgrade command if the download then fails.
+- **"This URL is a playlist or channel"** → refused: /watch reads one video at a time. Ask the user which video from it they mean and re-run with that URL.
+- **"This URL is a live broadcast"** → refused before downloading, because yt-dlp would record until the stream ends. Tell the user to re-run once it has finished; the same URL then resolves to a normal recording. (When the metadata fetch failed, a stderr note says the pre-check was blind — the download itself still refuses an ongoing broadcast.)
 - **`--motion` refused over a token ceiling** → the window is too wide for frame-by-frame sampling. Follow the message: narrow `--start`/`--end`, add `--crop`, or pass `--max-frames` deliberately. See `references/motion.md`.
 - **"no video stream"** → an audio-only file. The run still succeeds and returns a transcript; say that frames were not possible rather than treating it as an error.
 - **"is a still image"** → someone pointed /watch at a `.png`/`.jpg`. Read the file directly with the Read tool instead.
-- **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).
+- **"Whisper upload guard"** → the source exceeds ~60 minutes of audio, which is a real API bill. Relay the printed estimate to the user with `AskUserQuestion`; on a yes re-run with `--transcribe-anyway`, or offer `--start`/`--end` to transcribe just a section. Self-hosted endpoints are exempt.
+- **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the upload limit is split into ~24 MB chunks (the APIs cap uploads at 25 MB; the margin leaves multipart headroom) and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. A 429 whose server-requested wait exceeds 60 s fails fast naming the wait — that is quota exhaustion; switch backends (`--whisper openai` if Groq failed, or vice versa) or re-run later.
 
 ## Token efficiency
 
@@ -338,7 +295,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 - Otherwise sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
 - Otherwise sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set, or when `--whisper openai` is forced
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
-- Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s), an optional self-hosted endpoint, and a `SETUP_COMPLETE` marker. As a fallback, also reads `.env` in the current working directory
+- Reads / creates `~/.config/watch/.env` (mode `0600`) to store the Whisper API key(s), an optional self-hosted endpoint, and a `SETUP_COMPLETE` marker. As a fallback, every setting is also read from `.env` in the current working directory — except `SETUP_COMPLETE`, which is machine-config only so a cloned repo cannot mark another user's setup complete
 
 **What this skill does NOT do:**
 - Does not upload the video itself to any API — only the extracted audio goes out, and only when native captions are missing AND Whisper is not disabled with `--no-whisper`

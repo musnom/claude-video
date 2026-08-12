@@ -1,0 +1,8 @@
+# Attribute lookup for `git archive HEAD:skills/watch` — what build-skill.sh
+# runs to produce the claude.ai .skill bundle — resolves patterns relative to
+# THIS tree, so the repo-root .gitattributes' `skills/watch/...` entries never
+# match here and the bundle shipped dev files for two releases. Verified
+# empirically; tests/test_release.py pins the bundle contents.
+scripts/build-skill.sh export-ignore
+.skillignore           export-ignore
+.gitattributes         export-ignore

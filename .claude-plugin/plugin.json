@@ -1,12 +1,12 @@
 {
   "name": "watch",
-  "version": "0.4.0",
-  "description": "Let Claude watch a video. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls captions or falls back to Whisper, and hands frames + transcript to Claude so it can answer questions about the video.",
+  "version": "0.5.0",
+  "description": "Let the agent watch a video, screen recording, or audio file — URL or local path. Downloads with yt-dlp, extracts frames with ffmpeg, pulls captions or falls back to Whisper, and can also measure motion and animation timing/easing (--motion), characterize editing style and pacing, and read small on-screen text via --crop.",
   "author": {
     "name": "Mustafa Nomair"
   },
   "homepage": "https://github.com/mustafa-nom/claude-video",
   "repository": "https://github.com/mustafa-nom/claude-video",
   "license": "MIT",
-  "keywords": ["video", "watch", "youtube", "vimeo", "tiktok", "transcription", "whisper", "yt-dlp", "ffmpeg", "multimodal", "frames"]
+  "keywords": ["video", "watch", "youtube", "vimeo", "tiktok", "transcription", "whisper", "yt-dlp", "ffmpeg", "multimodal", "frames", "motion", "animation", "easing", "timing", "editing-style", "pacing", "screen-recording", "audio", "transcript"]
 }

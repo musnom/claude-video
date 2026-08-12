@@ -40,6 +40,8 @@ With Claude Video `/watch` you can paste a URL or a local path, ask a question, 
 
 **Turn a playlist into notes.** `/watch https://youtu.be/<video> summarize this to a note` Run it across a series and file a per-video summary, so a channel or course becomes a searchable set of notes instead of hours you have to sit through.
 
+**Measure and recreate motion.** `/watch reference.mp4 --motion --start 1.0 --end 1.6 what easing is this?` samples every source frame across a transition, labels each to the millisecond, and writes a stack-agnostic `motion.json` — enough to state a transition's duration and easing as numbers, and to rebuild the animation for your stack. `/watch <reference> characterize the editing style` reads the full detected-cut list (cuts/min, shot-length percentiles) instead of eyeballing pacing.
+
 ## How it works
 
 1. **You paste a video and a question.** URL (anything yt-dlp supports — YouTube, Loom, TikTok, X, Instagram, plus a few hundred more) or a local path (`.mp4`, `.mov`, `.mkv`, `.webm`).
@@ -69,31 +71,29 @@ When the user names a moment ("around 2:30", "the last 30 seconds", "from 0:45 t
 Frame selection — keyframes (`efficient`), scene-change detection (`balanced`/`token-burner`), or the uniform sampler it falls back to — can still surface near-identical frames: a screen recording that holds one slide for 90 seconds produces a dozen, each billed as a separate image. A dedup pass drops them before frames reach Claude. It runs by default on every frame mode (`--no-dedup` turns it off):
 
 1. One `ffmpeg` call scales each extracted JPEG to a 16×16 grayscale thumbnail. Everything after is pure-stdlib Python — no image libraries.
-2. For each frame, compute the **mean absolute difference** against the *last frame that was kept* (average per-pixel brightness change, 0–255 scale).
-3. If that difference is at or below the threshold (`2.0`), the frame is a near-duplicate and is dropped. Otherwise it's kept and becomes the new reference.
-4. The frame-budget cap applies *after* dedup, so the budget is spent on distinct frames.
+2. For each frame, compute the **mean** per-pixel difference *and* the **peak single-cell** difference against the *last frame that was kept*.
+3. A frame is dropped only when **both** are under threshold (mean ≤ 2.0 AND peak ≤ 8.0). The peak rule is what keeps a localized change — a slide gaining one bullet, a control changing state — that barely moves a whole-frame average.
+4. A trailing run of solid-black frames (end cards) is dropped on the same thumbnails; mid-video and leading black are kept — a fade-to-black boundary is editing information.
+5. The frame-budget cap applies *after* dedup, so the budget is spent on distinct frames — and the gap-fill pass that spends leftover budget applies the same rule in reverse: a fill that would just duplicate its neighbours is never created.
 
-Comparing against the last *kept* frame (not the previous one) catches slow fades that never trip a frame-to-frame threshold. The threshold is deliberately low and measures absolute brightness rather than structure, so a one-line code diff, a terminal scrolling a row, or two differently-colored flat slides all survive.
+Comparing against the last *kept* frame (not the previous one) catches slow fades that never trip a frame-to-frame threshold.
 
-The **Frames** line reports what was collapsed, e.g. `6 selected from 14 candidates (… 8 near-duplicates dropped …)`. On always-moving footage nothing is dropped and you pay what you would have anyway.
+The **Frames** line reports everything that moved the count, e.g. `100 selected from 11 candidates (scene, 3 near-duplicates dropped, 89 added to fill gaps, full range, cap 100)` — or, on static footage, `11 selected … 0 added to fill gaps (fill stopped early: 11 near-duplicate candidates rejected)`. On always-moving footage nothing is dropped and you pay what you would have anyway.
 
-## Detail modes — measured
+## Detail modes
 
-The `--detail` dial trades speed and token cost for visual fidelity. Numbers below are from a real run against a **49:08** YouTube video (1280×720, English auto-captions) — a long, mostly-static screen recording, the case that stresses the caps hardest. Extraction times are local CPU against a pre-downloaded copy; the one-time download was **~37 s** / 76 MB, shared by the three frame modes.
+The `--detail` dial trades speed and token cost for visual fidelity:
 
-| Mode | Engine | Frames | Cap | Extraction time | Temporal coverage | Est. image tokens |
-|------|--------|--------|-----|-----------------|-------------------|-------------------|
-| `transcript` | none (captions) | 0 | — | **~4.5 s** (one yt-dlp call, no download) | full (text) | 0 (≈26.6k text tokens) |
-| `efficient` | keyframe (`-skip_frame nokey`) | 50 | 50 | **~0.5 s** | 0:00 → 49:04 (full) | **~9.8k** |
-| `balanced` | scene-change | 100 | 100 | **~20.9 s** | 0:00 → 48:38 (full) | **~19.7k** |
-| `token-burner` | scene-change | 116 | uncapped | **~21.0 s** | 0:00 → 48:38 (full) | **~22.8k** |
+| Mode | Engine | Cap | Character |
+|------|--------|-----|-----------|
+| `transcript` | none (captions) | 0 frames | Cheapest by far — captioned URLs return without downloading video at all |
+| `efficient` | keyframe (`-skip_frame nokey`) | 50 | The speed tier: only reconstructs keyframes, ~40× faster than the scene modes (measured ~0.5 s vs ~21 s on a 49-minute 720p recording) |
+| `balanced` (default) | scene-change | 100 | Decodes every frame to find cuts, then spends leftover budget filling the widest time gaps — with distinct content only |
+| `token-burner` | scene-change | uncapped | Keeps *every* detected cut and gap-fills to at least `balanced`'s coverage — it can never return less than the default |
 
-- **Image tokens** use Anthropic's `(width × height) / 750` — at the default 512px width these 720p frames are 512×288, **≈197 tokens/frame**; `--resolution 1024` roughly 4×s that. The transcript is surfaced in every captioned mode and on long videos is often the larger cost.
-- **One sampling rule across frame modes.** Each detects all candidates across the full range, then even-samples (first + last always kept) down to its cap. The modes differ only in candidate *source* (keyframes vs. scene cuts) and cap, never in how coverage is spread — so the last frame always lands at the end, not partway through.
-- **`efficient` is the speed tier** (~0.5 s) — it only reconstructs keyframes, so it's ~40× faster than the scene modes, which decode every frame to find cuts. It can also return *more* frames than `balanced` on low-motion footage (keyframes outnumber scene cuts); "efficient" means fast extraction, not fewer frames.
-- **`token-burner` only diverges from `balanced` past the cap.** This clip had 116 cuts, so `balanced` sampled 100 and `token-burner` kept all 116. On high-motion video with hundreds of cuts, `token-burner` keeps everything (and trips the >250-frame token warning) while `balanced` thins to 100.
-
-End-to-end from a cold URL, `transcript` is the cheapest mode by far; the frame modes add the shared ~37 s download on top of the extraction times above.
+- **Image tokens** use Anthropic's `(width × height) / 750` — at the default 512px width a 720p frame is 512×288, **≈197 tokens/frame**; `--resolution 1024` roughly 4×s that. The transcript is surfaced in every captioned mode and on long videos is often the larger cost.
+- **One sampling rule across frame modes.** Each detects all candidates across the full range, then even-samples (first + last always kept) down to its cap — so the last frame always lands at the end, not partway through. The scene modes then top up the widest gaps, checking each fill against its neighbours with the dedup rule so static stretches are never padded: a 5-minute video of held shots comes back as ~a dozen distinct frames with a `fill stopped early` note, while a screen recording whose content evolves comes back near the cap.
+- **`efficient` can return *more* frames than `balanced`** on low-motion footage (encoders emit keyframes on a timer, so they can outnumber scene cuts); "efficient" means fast extraction, not fewer frames.
 
 ## Install
 
@@ -157,7 +157,7 @@ On the first `/watch` call, the skill runs `scripts/setup.py --check`. If `ffmpe
 - **macOS** — auto-runs `brew install ffmpeg yt-dlp`.
 - **Linux** — prints the exact `apt` / `dnf` / `pipx` commands.
 - **Windows** — prints the `winget` / `pip` commands.
-- **API key** — scaffolds `~/.config/watch/.env` (mode `0600`) with commented placeholders for `GROQ_API_KEY` (preferred) and `OPENAI_API_KEY`.
+- **Transcription** — scaffolds `~/.config/watch/.env` (mode `0600`) with commented placeholders for `GROQ_API_KEY` (preferred), `OPENAI_API_KEY`, and the fully-local `WATCH_WHISPER_ENDPOINT`. Declining transcription is a first-class choice: `python3 scripts/setup.py --complete` records it and you're never nagged again.
 
 After setup, preflight is silent and `/watch` just works. The check is a sub-100ms lookup, so it doesn't slow you down on subsequent runs.
 
@@ -212,9 +212,14 @@ Other knobs (passed to `scripts/watch.py`):
 - `--timestamps T1,T2,…` — grab a frame at each absolute timestamp (`SS`/`MM:SS`/`HH:MM:SS`). Claude reads the transcript first, then targets the moments the presenter flags ("look here", "as you can see"). Added on top of the detail frames (reserved against the cap); out-of-window cues are dropped in focus mode; with `--detail transcript` these become the only frames.
 - `--max-frames N` — lower the frame cap for a tighter token budget.
 - `--resolution W` — bump frame width to 1024 px when Claude needs to read on-screen text (slides, terminals, code).
-- `--fps F` — nudge the uniform sampler's rate (still capped at 2 fps). Only affects the uniform-sampling fallback, so it has no effect under `--detail efficient` or on clips the scene engine handles.
+- `--fps F` — nudge the uniform sampler's rate (still capped at 2 fps; asking for more prints a clamp notice). Only affects the uniform-sampling fallback, so it has no effect under `--detail efficient` or on clips the scene engine handles.
+- `--scene-threshold T` — how different two frames must be to count as a cut, 0–1 (default 0.05; lower finds more). Scene modes only. The default already catches motion-graphics cuts; reach for `0.03` when something you can see cutting reports "too few shots".
 - `--whisper groq|openai|custom` — force a specific Whisper backend. Default: a self-hosted endpoint if `WATCH_WHISPER_ENDPOINT` is set, else Groq, else OpenAI.
 - `--no-whisper` — disable transcription entirely; frames only.
+- `--transcribe-anyway` — proceed past the ~60-minute cloud-transcription guard (a long captionless video is a real API bill; the guard prints the estimate first).
+- `--sub-langs LIST` — override the caption languages requested (also `WATCH_SUB_LANGS` in the config), for videos whose only track is a regional variant (`en-CA`) or a non-English language without an `-orig` track.
+- `--cookies-from-browser BROWSER[:PROFILE]` — read cookies from a local browser so yt-dlp can reach a login-walled, age-gated or members-only video (e.g. `chrome`, `firefox:default`). Strictly opt-in; nothing is read unless you pass it.
+- `--cookies FILE` — same, from an exported Netscape-format cookie file.
 - `--motion` — frame-by-frame motion analysis for measuring or recreating animation. Samples the source's own frames rather than resampling to a rate, labels each with its measured timestamp to the millisecond, and never dedups. Writes a stack-agnostic `motion.json` alongside the frames. Overrides `--detail`.
 - `--crop x,y,w,h` — crop to a region in source pixels before scaling. A 160x120 component out of a 1920x1080 frame arrives at 1:1 rather than 8% of the width, so its position is measurable — and it costs fewer tokens, not more.
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the one before them (held slides, static screen recordings, paused video), so the frame budget is spent on distinct content; this flag turns that off.
@@ -231,22 +236,26 @@ Other knobs (passed to `scripts/watch.py`):
 .
 ├── skills/watch/                 # self-contained skill — copied as a unit by every installer
 │   ├── SKILL.md                  # skill contract — the source of truth across all surfaces
+│   ├── references/
+│   │   ├── motion.md             # the --motion measurement/recreation workflow (read on demand)
+│   │   ├── editing-style.md      # pacing / motion-graphics characterization workflow
+│   │   └── setup.md              # first-run + remediation flow (read when preflight says so)
 │   └── scripts/
 │       ├── watch.py              # entry point — orchestrates download → frames → transcript
-│       ├── download.py           # yt-dlp wrapper
-│       ├── frames.py             # ffmpeg frame extraction + auto-fps logic
+│       ├── download.py           # yt-dlp wrapper (retry, failure classification, guards)
+│       ├── frames.py             # ffmpeg frame extraction + auto-fps + dedup + gap-fill
 │       ├── transcribe.py         # VTT parsing + dedupe + Whisper orchestration
-│       ├── whisper.py            # Groq / OpenAI clients (pure stdlib)
-│       ├── config.py             # shared config (~/.config/watch/.env)
-│       ├── setup.py              # preflight + installer
+│       ├── whisper.py            # Groq / OpenAI / self-hosted clients (pure stdlib)
+│       ├── config.py             # shared settings resolution (env → ~/.config/watch/.env → ./.env)
+│       ├── setup.py              # preflight + installer (+ --complete)
 │       └── build-skill.sh        # build dist/watch.skill for claude.ai upload (dev-only)
 ├── hooks/                        # SessionStart status hook (Claude Code only)
 ├── .claude-plugin/               # plugin.json + marketplace.json (Claude Code)
 ├── .codex-plugin/                # plugin.json — Codex/agents manifest ("skills": "./skills/")
 ├── .agents/plugins/              # marketplace.json — Agent Skills marketplace listing
-├── AGENTS.md → CLAUDE.md         # generic-agent entry point
+├── CLAUDE.md → AGENTS.md         # generic-agent entry point (CLAUDE.md includes AGENTS.md)
 ├── tests/                        # pytest suite (ffmpeg-synthesized clips, no network)
-└── .github/workflows/            # release.yml — auto-builds watch.skill on tag push
+└── .github/workflows/            # tests.yml (branch CI) + release.yml (tag → test → build watch.skill)
 ```
 
 ## Develop
@@ -269,7 +278,7 @@ MIT license.
 
 Built on `yt-dlp`, `ffmpeg`, and Claude's multimodal `Read` tool. Whisper transcription via [Groq](https://groq.com) or [OpenAI](https://openai.com).
 
-Built by Brad Bonanno — I make content about building with AI on [YouTube (@bradbonanno)](https://www.youtube.com/@bradbonanno), and build AI operating systems for businesses at [Solaris Automation](https://www.solarisautomation.io/). If `/watch` saves you from scrubbing through a video, come say hi on the channel.
+Maintained by [Mustafa Nomair](https://github.com/mustafa-nom). Forked from [bradautomates/claude-video](https://github.com/bradautomates/claude-video) by Brad Bonanno, who makes content about building with AI on [YouTube (@bradbonanno)](https://www.youtube.com/@bradbonanno) — see the [CHANGELOG](CHANGELOG.md) for what has diverged since the fork.
 
 ## Star History
 
@@ -283,4 +292,4 @@ Built by Brad Bonanno — I make content about building with AI on [YouTube (@br
 
 ---
 
-[github.com/mustafa-nom/claude-video](https://github.com/mustafa-nom/claude-video) · [@bradbonanno](https://www.youtube.com/@bradbonanno) · [Solaris Automation](https://www.solarisautomation.io/) · [LICENSE](LICENSE)
+[github.com/mustafa-nom/claude-video](https://github.com/mustafa-nom/claude-video) · [upstream](https://github.com/bradautomates/claude-video) · [LICENSE](LICENSE)

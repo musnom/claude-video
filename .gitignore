@@ -14,3 +14,9 @@ htmlcov/
 
 # local Claude Code settings
 .claude/settings.local.json
+
+# dev-only audit/planning docs — never committed; a tracked planning doc
+# shipped to every plugin install once (exclusion lists drift; .gitignore
+# doesn't)
+gaps.md
+Plan Features.md

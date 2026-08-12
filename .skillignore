@@ -26,8 +26,8 @@ README.md
 CHANGELOG.md
 AGENTS.md
 CLAUDE.md
-V2_PLAN.md
-V2_CONCERNS.md
+gaps.md
+Plan Features.md
 
 # Dev-only script shipped inside the skill tree but not needed at runtime
 skills/watch/scripts/build-skill.sh

@@ -9,7 +9,33 @@ permissions:
   contents: write
 
 jobs:
+  # A tag used to publish with ZERO verification: tests.yml ignores v* tags and
+  # this workflow went straight to build-and-release, so a broken commit could
+  # ship as a public release. The suite now gates the build on the exact tree
+  # the tag names. macOS runner because the fixtures synthesize clips with
+  # brew-installed ffmpeg — the same environment tests.yml uses.
+  test:
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg and yt-dlp
+        run: brew install ffmpeg yt-dlp
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest -q
+
   build-and-release:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

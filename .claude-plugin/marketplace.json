@@ -1,7 +1,7 @@
 {
   "name": "claude-video",
   "metadata": {
-    "description": "Give Claude a video input. /watch downloads, extracts frames, transcribes, and hands it all to Claude."
+    "description": "Give Claude a video input. /watch downloads, extracts frames, transcribes, measures motion and pacing, and hands it all to Claude."
   },
   "owner": {
     "name": "Mustafa Nomair"
@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "watch",
-      "description": "Watch a video (URL or local path). Downloads with yt-dlp, extracts frames with ffmpeg, transcribes via captions or Whisper.",
+      "description": "Watch a video, screen recording, or audio file (URL or local path). Downloads with yt-dlp, extracts frames with ffmpeg, transcribes via captions or Whisper, measures animation timing and easing with --motion, and characterizes editing style and pacing.",
       "author": {
         "name": "Mustafa Nomair"
       },

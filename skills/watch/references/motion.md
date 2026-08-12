@@ -65,12 +65,15 @@ Three things come out of a motion run, and they are all you need:
 Convert pixels to layout units using the **source** dimensions from the report, not the frame
 dimensions — the frames are scaled and, when cropped, offset by the crop origin.
 
-If the user wants this as code, write it the way you would write any other code, for their
-stack and no one else's. Two things are worth carrying over from the measurement into whatever
-you produce: **state the numbers you measured** next to it, so they can check your work rather
-than trust it, and say which easing you concluded and why. `motion.json` is deliberately
-stack-agnostic — durations, positions and a change signal, no CSS, no keyframes, no easing
-names — so it serves any target equally.
+If the user wants this as code, put the code **in your answer** — a code block written for
+their stack and no one else's, not a file. This skill's tool contract (`allowed-tools: Bash,
+Read, AskUserQuestion`) deliberately does not include file editing; if the user then asks you
+to apply the code to their project, do that through your host's normal tools and permissions,
+outside this skill. Two things are worth carrying from the measurement into the code:
+**state the numbers you measured** next to it, so they can check your work rather than trust
+it, and say which easing you concluded and why. `motion.json` is deliberately stack-agnostic —
+durations, positions and a change signal, no CSS, no keyframes, no easing names — so it serves
+any target equally.
 
 ### An ease-out's measured duration is shorter than its authored duration
 

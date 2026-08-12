@@ -1,7 +1,7 @@
 {
   "name": "watch",
-  "version": "0.4.0",
-  "description": "Let Claude watch a video. Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls captions or falls back to Whisper, and hands frames + transcript to Claude so it can answer questions about the video.",
+  "version": "0.5.0",
+  "description": "Let the agent watch a video, screen recording, or audio file — URL or local path. Downloads with yt-dlp, extracts frames with ffmpeg, pulls captions or falls back to Whisper, and can also measure motion and animation timing/easing (--motion), characterize editing style and pacing, and read small on-screen text via --crop.",
   "author": {
     "name": "Mustafa Nomair"
   },
@@ -19,13 +19,22 @@
     "yt-dlp",
     "ffmpeg",
     "multimodal",
-    "frames"
+    "frames",
+    "motion",
+    "animation",
+    "easing",
+    "timing",
+    "editing-style",
+    "pacing",
+    "screen-recording",
+    "audio",
+    "transcript"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "watch",
-    "shortDescription": "Give Claude a video input — paste a URL or path and ask about it.",
-    "longDescription": "watch adds a skill that lets the agent watch any video: it downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls a timestamped transcript from native captions (or the Whisper API as a fallback), and hands frames + transcript to the model so it can answer questions grounded in what's actually on screen and in the audio.",
+    "shortDescription": "Give the agent a video input — watch, transcribe, and measure motion, animation timing and editing pacing from a URL or local file.",
+    "longDescription": "watch adds a skill that lets the agent watch any video, screen recording, or audio file: it downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls a timestamped transcript from native captions (or the Whisper API as a fallback), and hands frames + transcript to the model. Beyond Q&A and summaries it measures motion — animation timing, transition durations, easing curves (--motion) — characterizes editing style and pacing from the full detected-cut list, and crops regions so small on-screen text is legible.",
     "developerName": "Mustafa Nomair",
     "category": "Productivity",
     "capabilities": [

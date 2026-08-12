@@ -30,8 +30,9 @@ Two things this does *not* mean:
 - Don't break other platforms on purpose. Keep the code portable where that's
   free; just don't invest in it.
 
-CI still runs on ubuntu / macOS / windows. macOS is the one that matters — a
-red Windows run is information, not a blocker.
+CI runs on macOS only (tests.yml on branch pushes and PRs; release.yml re-runs
+the suite on macOS before building on a tag). Restoring cross-platform coverage
+is a one-line matrix change in tests.yml if it is ever wanted.
 
 ## Orientation
 

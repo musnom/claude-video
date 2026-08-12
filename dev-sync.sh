@@ -80,7 +80,8 @@ rsync -a ${DRY_RUN[@]+"${DRY_RUN[@]}"} \
   --exclude 'tests/' \
   --exclude 'docs/' \
   --exclude 'dist/' \
-  --exclude 'V2_*.md' \
+  --exclude 'gaps.md' \
+  --exclude 'Plan Features.md' \
   --exclude 'dev-sync.sh' \
   "$REPO_ROOT/" "$DEST/"
 
