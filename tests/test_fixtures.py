@@ -827,3 +827,42 @@ def test_dissolve_coded_plane_matches_the_documented_levels(dissolve_clip: Path)
     assert coded_luma(dissolve_frame_index(5.000)) == {DISSOLVE_CODED_C}
     # The metric's view of the cut: mean |dY| = 176 -> 1.76, clipped to 1.0.
     assert abs(DISSOLVE_CODED_B - DISSOLVE_CODED_A) == 176
+
+
+# --- sparse-moving clip -------------------------------------------------------
+# The gap-fill calibration fixture: static shots with a drifting two-tone marker
+# so a fill probe anywhere is distinct from its neighbours while contributing
+# nothing to the scene metric. Both halves of that claim are calibrations that
+# can drift with encoders, so both are pinned here rather than trusted.
+
+
+def test_sparse_moving_clip_is_five_minutes(sparse_moving_clip):
+    assert sparse_moving_clip.exists() and sparse_moving_clip.stat().st_size > 0
+    assert abs(_duration(sparse_moving_clip) - 300.0) < 1.0
+
+
+def test_sparse_moving_clip_has_exactly_the_authored_cuts(sparse_moving_clip):
+    """The 11 authored cuts are found at the production threshold, and the
+    marker's drift (including its wrap at t=150) adds NO false cuts."""
+    from conftest import sparse_moving_cut_times
+
+    cuts = scene_cut_times(sparse_moving_clip, threshold=0.05)
+    assert cuts == [round(t, 3) for t in sparse_moving_cut_times()]
+
+
+def test_sparse_moving_marker_defeats_the_duplicate_check(sparse_moving_clip, tmp_path):
+    """Two frames 1 s apart — the worst-case midpoint-to-bound distance the fill
+    loop compares at — must NOT be near-duplicates, or the fixture cannot prove
+    the budget-spending path. Probed inside the 60 s magenta shot."""
+    import frames
+
+    grabbed, _ = frames.extract_at_timestamps(
+        str(sparse_moving_clip), tmp_path, [200.0, 201.0, 230.0],
+    )
+    assert len(grabbed) == 3
+    thumbs = frames._thumb_frames([Path(f["path"]) for f in grabbed])
+    assert len(thumbs) == 3
+    for a, b in ((0, 1), (1, 2), (0, 2)):
+        assert not frames._is_near_duplicate(
+            thumbs[a], thumbs[b], frames.DEDUP_THRESHOLD, frames.DEDUP_PEAK_THRESHOLD
+        ), f"frames {a},{b} read as duplicates — marker calibration drifted"

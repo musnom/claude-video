@@ -24,7 +24,7 @@ from config import ensure_utf8_console, frame_cap, get_config  # noqa: E402
 # the download and every frame extraction have already succeeded.
 ensure_utf8_console()
 from download import download, fetch_captions, is_url  # noqa: E402
-from frames import MAX_FPS, MOTION_HARD_MAX, MOTION_TOKEN_CEILING, SCENE_THRESHOLD, frame_dimensions, image_tokens, measure_motion, motion_envelope, motion_interval, parse_crop, validate_crop, auto_fps, auto_fps_focus, extract_at_timestamps, extract_motion, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
+from frames import MAX_FPS, MOTION_HARD_MAX, MOTION_TOKEN_CEILING, MOTION_TOKEN_HARD_CEILING, SCENE_THRESHOLD, frame_dimensions, measure_motion, motion_envelope, motion_token_estimate, parse_crop, validate_crop, auto_fps, auto_fps_focus, extract_at_timestamps, extract_motion, extract_keyframes, extract_scene_or_uniform, format_time, format_time_ms, get_metadata, merge_frames, parse_time, parse_timestamps  # noqa: E402
 from transcribe import filter_range, format_transcript, parse_vtt  # noqa: E402
 from whisper import load_api_key, transcribe_video  # noqa: E402
 
@@ -272,6 +272,11 @@ def main() -> int:
         raise SystemExit(
             f"--scene-threshold must be between 0 and 1 (got {args.scene_threshold})"
         )
+    # A non-positive rate is not clampable intent — with the old bare min() it
+    # sailed through to the select filter, where interval 0 passes EVERY decoded
+    # frame (~18,000 JPEGs on a 10-minute 30fps clip) before thinning.
+    if args.fps is not None and args.fps <= 0:
+        raise SystemExit(f"--fps must be positive (got {args.fps:g})")
 
     config = get_config()
     detail = args.detail or str(config["detail"])
@@ -396,8 +401,25 @@ def main() -> int:
         raise SystemExit("--start must be non-negative")
     if end_sec is not None and start_sec is not None and end_sec <= start_sec:
         raise SystemExit("--end must be greater than --start")
+    # A bare `--end 0` used to slip past the check above (it requires --start)
+    # and produce a zero-length window: focused=True, an empty Frames section,
+    # and no error. An empty window is a mistake, not a request.
+    if end_sec is not None and start_sec is None and end_sec <= 0:
+        raise SystemExit(f"--end must be greater than 0 (got {end_sec:.1f}s)")
     if full_duration > 0 and start_sec is not None and start_sec >= full_duration:
         raise SystemExit(f"--start {start_sec:.1f}s is past end of video ({full_duration:.1f}s)")
+    # Clamp rather than reject: a long --end most plausibly means "through the
+    # end". Unclamped it printed a Focus-range line for a range that does not
+    # exist and budgeted frames against the phantom duration — which lands in a
+    # SPARSER auto_fps_focus band, inverting the documented denser-focus
+    # contract — and asked Whisper for audio past end-of-stream.
+    if end_sec is not None and full_duration > 0 and end_sec > full_duration:
+        print(
+            f"[watch] --end {end_sec:.1f}s is past the end of the video "
+            f"({full_duration:.1f}s) — clamped to the end",
+            file=sys.stderr,
+        )
+        end_sec = full_duration
 
     effective_start = start_sec if start_sec is not None else 0.0
     effective_end = end_sec if end_sec is not None else full_duration
@@ -415,6 +437,15 @@ def main() -> int:
                 "[watch] --fps is ignored with --motion: motion samples the source's own "
                 "frames rather than resampling to a rate. Narrow --start/--end to control "
                 "the frame count instead.",
+                file=sys.stderr,
+            )
+        # The clamp itself must be reported: the "--fps had no effect" warning
+        # below cannot cover it, because on a uniform run the (clamped) rate DID
+        # apply — the user asked for 25, sampling ran at 2, and nothing said so.
+        elif args.fps > MAX_FPS:
+            print(
+                f"[watch] --fps {args.fps:g} exceeds the {MAX_FPS:g} fps auto-sampling "
+                f"ceiling — sampling at {MAX_FPS:g} fps",
                 file=sys.stderr,
             )
         fps = min(args.fps, MAX_FPS)
@@ -466,22 +497,15 @@ def main() -> int:
         # cap *thinned* the run — i.e. when it got cheaper — and it prints after
         # the JPEGs are already on disk and about to be read.
         source_fps = meta.get("fps")
+        # An unknown frame rate is not a reason to skip the guard — it is a
+        # reason to assume the worst: motion_interval does no thinning without
+        # a rate, so the run extracts every source frame up to the cap.
+        estimated, per_frame, estimated_tokens = motion_token_estimate(
+            effective_duration, source_fps, motion_cap,
+            meta.get("width"), meta.get("height"), args.resolution, crop,
+        )
+        dims = frame_dimensions(meta.get("width"), meta.get("height"), args.resolution, crop)
         if args.max_frames is None:
-            # An unknown frame rate is not a reason to skip the guard — it is a
-            # reason to assume the worst. motion_interval does no thinning
-            # without a rate, so the run extracts every source frame up to
-            # MOTION_HARD_MAX; estimating against the cap is exactly right.
-            if source_fps:
-                interval = motion_interval(effective_duration, source_fps, motion_cap)
-                estimated = (
-                    min(motion_cap, int(source_fps * effective_duration)) if interval == 0
-                    else int(effective_duration / interval)
-                )
-            else:
-                estimated = min(motion_cap, MOTION_HARD_MAX)
-            dims = frame_dimensions(meta.get("width"), meta.get("height"), args.resolution, crop)
-            per_frame = image_tokens(*dims) if dims else 0
-            estimated_tokens = estimated * per_frame
             if per_frame and estimated_tokens > MOTION_TOKEN_CEILING:
                 raise SystemExit(
                     f"--motion over {scope} would extract ~{estimated} frames at "
@@ -502,6 +526,27 @@ def main() -> int:
                     "the per-frame cost as well as making the motion measurable\n"
                     f"  * or pass `--max-frames N` to accept the cost deliberately"
                 )
+        elif per_frame and estimated_tokens > MOTION_TOKEN_HARD_CEILING:
+            # An explicit --max-frames chooses the frame COUNT; it does not
+            # bound the cost of reading the frames, which scales with
+            # --resolution and the source size as well.
+            raise SystemExit(
+                f"--motion --max-frames {args.max_frames} over {scope} would be "
+                f"~{estimated} frames at {dims[0]}x{dims[1]} — roughly "
+                f"{estimated_tokens // 1000}k image tokens to read, over the absolute "
+                f"{MOTION_TOKEN_HARD_CEILING // 1000}k ceiling, which an explicit "
+                "frame cap does not lift.\n"
+                "Lower --resolution, add --crop x,y,w,h to isolate the moving "
+                "component, or narrow --start/--end."
+            )
+        if per_frame:
+            # The cost prints unconditionally and BEFORE extraction — when it can
+            # still inform a decision, not after the JPEGs exist.
+            print(
+                f"[watch] motion: ~{estimated} frames at {dims[0]}x{dims[1]} ≈ "
+                f"{max(1, estimated_tokens // 1000)}k image tokens to read",
+                file=sys.stderr,
+            )
         print(
             f"[watch] motion: sampling source frames over {scope} "
             f"(source ~{meta.get('fps') or 0:.1f} fps, cap {min(motion_cap, MOTION_HARD_MAX)})…",
@@ -572,6 +617,7 @@ def main() -> int:
                     args.scene_threshold if args.scene_threshold is not None
                     else SCENE_THRESHOLD
                 ),
+                full_duration=full_duration,
             )
 
     # --scene-threshold has no meaning outside the scene engine: the keyframe
@@ -611,6 +657,9 @@ def main() -> int:
         )
 
     if cue_frames:
+        # Order is load-bearing under --motion: motion.json was serialized before
+        # this merge, so the measurement artifact stays cue-free while the report
+        # lists both. Cue dicts carry no motion fields (gap_ms etc.) on purpose.
         frames = merge_frames(frames, cue_frames)
 
     if not transcript_segments and dl.get("subtitle_path"):
@@ -722,8 +771,14 @@ def main() -> int:
             f"- **Motion window:** {format_time_ms(effective_start)} → "
             f"{format_time_ms(effective_end)} ({effective_duration:.3f}s)"
         )
+        # The section below lists motion + cue frames, so the count here must
+        # account for both or the line disagrees with the list under it.
+        cue_note = (
+            f" + {len(cue_frames)} cue frame{'s' if len(cue_frames) != 1 else ''}"
+            if cue_frames else ""
+        )
         print(
-            f"- **Frames:** {detail_count} (motion, "
+            f"- **Frames:** {detail_count}{cue_note} (motion, "
             f"sampled {sampled if sampled is not None else '?'} fps, {source_note}, "
             f"gaps {lo}-{hi} ms, {coverage}, dedup off, cap {frame_meta.get('cap')})"
         )
@@ -791,11 +846,29 @@ def main() -> int:
         fallback = ""
         deduped = frame_meta.get("deduped_count", 0)
         dedup_note = f", {deduped} near-duplicate{'s' if deduped != 1 else ''} dropped" if deduped else ""
+        blank = frame_meta.get("blank_dropped", 0)
+        blank_note = (
+            f", {blank} trailing black frame{'s' if blank != 1 else ''} dropped (end card)"
+            if blank else ""
+        )
         # Say when frames were added, or the count silently disagrees with the
         # candidate count and the reader has no way to tell which frames landed
-        # on a cut and which were placed to cover a hole.
+        # on a cut and which were placed to cover a hole. Say when filling
+        # STOPPED, too — a fill count under the cap is not a failure, it means
+        # the remaining holes proved static.
         filled = frame_meta.get("gap_filled", 0)
-        fill_note = f", {filled} added to fill gaps" if filled else ""
+        rejected = frame_meta.get("gap_fill_rejected", 0)
+        fill_failed = frame_meta.get("gap_fill_failed", 0)
+        fill_note = ""
+        if filled or rejected:
+            fill_note = f", {filled} added to fill gaps"
+            if rejected:
+                fill_note += (
+                    f" (fill stopped early: {rejected} near-duplicate "
+                    f"candidate{'s' if rejected != 1 else ''} rejected)"
+                )
+        if fill_failed:
+            fill_note += f", {fill_failed} fill decode{'s' if fill_failed != 1 else ''} failed"
         # Cap and budget are read back from the engine that ran, not from the
         # duration `target` computed above. `target`/`fps` reach only the uniform
         # fallback, so the old unconditional "budget {target}" described a code
@@ -805,9 +878,14 @@ def main() -> int:
         cap_note = "uncapped" if effective_cap is None else f"cap {effective_cap}"
         engine_budget = frame_meta.get("budget")
         budget_note = f", budget {engine_budget}" if engine_budget is not None else ""
+        # The effective uniform rate, stated only when the caller's --fps really
+        # governed the sampling — the flag's silent clamp used to be invisible
+        # precisely because no line ever said what rate actually ran.
+        rate_note = f", sampled at {fps:g} fps" if frame_meta.get("fps_applied") else ""
         print(
             f"- **Frames:** {detail_count} selected from {frame_meta.get('candidate_count', detail_count)} "
-            f"candidates ({engine}{fallback}{dedup_note}{fill_note}, {range_mode} range{budget_note}, {cap_note})"
+            f"candidates ({engine}{fallback}{dedup_note}{blank_note}{fill_note}, "
+            f"{range_mode} range{budget_note}{rate_note}, {cap_note})"
         )
         # Cut rhythm, from the full detected list rather than from whichever
         # frames survived sampling. Reading the gaps between kept frames as shot
@@ -816,8 +894,17 @@ def main() -> int:
         shots = frame_meta.get("shots") or {}
         if shots.get("cuts"):
             rate = f"{shots['per_minute']:.1f}/min" if shots.get("per_minute") else "rate unknown"
+            # "at least", and the threshold named: detection misses cuts below
+            # the scene threshold (measured -16% on ordinary footage, -65% on
+            # low-contrast), so the count is a lower bound and quoting it as
+            # exact was the report's own "state measured numbers" rule violated.
+            threshold_used = (
+                args.scene_threshold if args.scene_threshold is not None
+                else SCENE_THRESHOLD
+            )
             print(
-                f"- **Shots:** {shots['cuts']} cuts, {rate} — median {shots['median_s']:.2f}s, "
+                f"- **Shots:** at least {shots['cuts']} cuts (detected at scene threshold "
+                f"{threshold_used:g}), {rate} — median {shots['median_s']:.2f}s, "
                 f"p10 {shots['p10_s']:.2f}s, p90 {shots['p90_s']:.2f}s "
                 f"(shortest {shots['shortest_s']:.2f}s, longest {shots['longest_s']:.2f}s)"
             )
@@ -831,12 +918,14 @@ def main() -> int:
                 print(f"  Cuts at: {times}")
     elif not cue_frames:
         print("- **Frames:** skipped (transcript detail)")
-    if cue_frames:
+    if cue_frames or cue_meta.get("extraction_failed"):
         dropped = cue_meta.get("dropped_out_of_window", 0)
         drop_note = f", {dropped} dropped outside range" if dropped else ""
+        failed = cue_meta.get("extraction_failed", 0)
+        failed_note = f", {failed} failed to decode" if failed else ""
         print(
             f"- **Cue frames:** {len(cue_frames)} at transcript-flagged timestamps "
-            f"(transcript-cue{drop_note})"
+            f"(transcript-cue{drop_note}{failed_note})"
         )
     if frames:
         print(f"- **Frame size:** max {args.resolution}px wide, max 1998px tall")
@@ -880,11 +969,20 @@ def main() -> int:
             "`transcript-cue` and `gap-fill` frames carry the time that was *requested* — the "
             "decoder returns the nearest frame at or after it."
         )
+        estimated_count = sum(1 for f in frames if f.get("estimated"))
+        if estimated_count:
+            print()
+            print(
+                f"{estimated_count} frame{'s are' if estimated_count != 1 else ' is'} "
+                "marked `estimated` — the measured time was unavailable for "
+                "them, so the label is the requested time, not a measured one."
+            )
         print()
         for frame in frames:
+            estimated_note = ", estimated" if frame.get("estimated") else ""
             print(
                 f"- `{frame['path']}` "
-                f"(t={_frame_stamp(frame)}, reason={frame.get('reason', 'selected')})"
+                f"(t={_frame_stamp(frame)}{estimated_note}, reason={frame.get('reason', 'selected')})"
             )
     else:
         print("_No frames extracted._")

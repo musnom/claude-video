@@ -367,25 +367,47 @@ def test_scene_threshold_says_so_when_it_does_nothing(motion_clip: Path, extra, 
     assert why in proc.stderr
 
 
-def test_gap_fill_is_reported_not_silent(sparse_cuts_clip: Path):
-    """88 of 100 frames placed by the tool rather than found by detection is not
+def test_gap_fill_is_reported_not_silent(sparse_moving_clip: Path):
+    """Dozens of frames placed by the tool rather than found by detection is not
     a detail to leave out of the line that says where the frames came from."""
-    out = _run(sparse_cuts_clip, "--detail", "balanced")
+    out = _run(sparse_moving_clip, "--detail", "balanced")
     assert "added to fill gaps" in out
     assert "reason=gap-fill" in out
     assert "reason=scene-change" in out
 
 
+def test_gap_fill_early_stop_is_reported(sparse_cuts_clip: Path):
+    """When fills stop because the remaining candidates duplicate their
+    neighbours, the report says so instead of leaving an unexplained gap between
+    the frame count and the cap."""
+    out = _run(sparse_cuts_clip, "--detail", "balanced")
+    assert "fill stopped early" in out
+    assert "near-duplicate candidate" in out
+    assert "reason=gap-fill" not in out
+
+
 def test_report_states_the_cut_rhythm(fast_cut_clip: Path):
     """`--detail balanced` caps at 100 frames; the shot line has to describe the
-    video regardless of how many frames survived that cap."""
+    video regardless of how many frames survived that cap — and as a lower
+    bound, because detection misses cuts under the scene threshold."""
     out = _run(fast_cut_clip, "--detail", "balanced", "--max-frames", "6")
-    match = re.search(r"\*\*Shots:\*\* (\d+) cuts, ([0-9.]+)/min — median ([0-9.]+)s", out)
+    match = re.search(
+        r"\*\*Shots:\*\* at least (\d+) cuts \(detected at scene threshold ([0-9.]+)\), "
+        r"([0-9.]+)/min — median ([0-9.]+)s",
+        out,
+    )
     assert match, out
-    cuts, per_minute, median = int(match.group(1)), float(match.group(2)), float(match.group(3))
+    cuts, threshold = int(match.group(1)), float(match.group(2))
+    per_minute, median = float(match.group(3)), float(match.group(4))
     assert cuts >= 20, out
+    assert threshold == pytest.approx(0.05)
     assert 100 <= per_minute <= 130, out
     assert 0.45 <= median <= 0.55, out
+
+
+def test_shot_line_echoes_the_requested_threshold(fast_cut_clip: Path):
+    out = _run(fast_cut_clip, "--detail", "balanced", "--scene-threshold", "0.1")
+    assert "detected at scene threshold 0.1)" in out
 
 
 def test_shot_line_is_absent_when_there_are_no_shots(static_clip: Path):
@@ -556,7 +578,7 @@ def test_report_states_the_shot_rate_over_the_clip_not_the_cut_span(tmp_path: Pa
         check=True, capture_output=True,
     )
     out = _run(clip, "--detail", "balanced")
-    match = re.search(r"\*\*Shots:\*\* (\d+) cuts, ([0-9.]+)/min.*longest ([0-9.]+)s", out)
+    match = re.search(r"\*\*Shots:\*\* at least (\d+) cuts \([^)]*\), ([0-9.]+)/min.*longest ([0-9.]+)s", out)
     assert match, out
     cuts, per_minute, longest = int(match.group(1)), float(match.group(2)), float(match.group(3))
     # 30s clip: whatever the detector counted, the rate is that over 30s.
@@ -636,3 +658,91 @@ def test_frame_rate_is_omitted_rather_than_faked_when_unknown(monkeypatch, cut_c
     assert frames_mod.parse_frame_rate("0/0") is None
     out = _run(cut_clip, "--detail", "transcript")
     assert "@ 0 fps" not in out
+
+
+# --- --fps and --end bounds -----------------------------------------------------
+
+
+def test_fps_clamp_is_reported(static_clip: Path):
+    """--fps 25 used to sample at 2 fps with nothing on stderr — the user asked
+    for a rate, got an eighth of it, and was told nothing (gaps.md G3)."""
+    proc = subprocess.run(
+        [sys.executable, str(WATCH), str(static_clip), "--no-whisper",
+         "--no-dedup", "--fps", "25"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "exceeds" in proc.stderr
+    assert "25" in proc.stderr and "2 fps" in proc.stderr
+
+
+@pytest.mark.parametrize("bad", ["0", "-1"])
+def test_non_positive_fps_is_rejected(static_clip: Path, bad: str):
+    proc = subprocess.run(
+        [sys.executable, str(WATCH), str(static_clip), "--no-whisper", "--fps", bad],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode != 0
+    assert "must be positive" in proc.stderr
+
+
+def test_report_states_the_effective_uniform_rate(static_clip: Path):
+    """When --fps really governed the sampling, the Frames line says the rate
+    that ran — the other half of making the clamp visible."""
+    out = _run(static_clip, "--no-dedup", "--fps", "1")
+    assert "sampled at 1 fps" in out
+
+
+def test_end_past_eof_is_clamped_and_reported(static_clip: Path):
+    """--end 99:00 on a 3s clip used to print a Focus-range line for a range
+    that does not exist and budget frames against the phantom duration."""
+    proc = subprocess.run(
+        [sys.executable, str(WATCH), str(static_clip), "--no-whisper",
+         "--start", "1", "--end", "99:00"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "clamped" in proc.stderr
+    assert re.search(r"\*\*Focus range:\*\* 00:01 → 00:03", proc.stdout), proc.stdout
+
+
+def test_bare_end_zero_is_rejected(static_clip: Path):
+    """A zero-length window is a mistake, not a request — it used to produce an
+    empty Frames section silently."""
+    proc = subprocess.run(
+        [sys.executable, str(WATCH), str(static_clip), "--no-whisper", "--end", "0"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode != 0
+    assert "--end must be greater than 0" in proc.stderr
+
+
+# --- motion cost visibility ------------------------------------------------------
+
+
+def test_motion_prints_the_token_estimate_before_extracting(slide_clip: Path):
+    proc = subprocess.run(
+        [sys.executable, str(WATCH), str(slide_clip), "--no-whisper",
+         "--motion", "--start", "0.9", "--end", "1.6"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "image tokens to read" in proc.stderr
+
+
+def test_motion_frames_line_accounts_for_cue_frames(slide_clip: Path):
+    """--motion --timestamps used to count only the motion frames in the Frames
+    line while listing motion + cue frames below it."""
+    out = _run(
+        slide_clip, "--motion", "--start", "0.9", "--end", "1.6",
+        "--timestamps", "1.0",
+    )
+    match = re.search(r"\*\*Frames:\*\* (\d+) \+ (\d+) cue frame", out)
+    assert match, out
+    motion_count, cue_count = int(match.group(1)), int(match.group(2))
+    assert cue_count == 1
+    # _frame_lines only matches frame_*.jpg; cue rows are cue_*.jpg.
+    listed = len(re.findall(r"\(t=[0-9:.]+, reason=", out))
+    assert listed == motion_count + cue_count
+    # motion.json stays cue-free: it was serialized before the merge.
+    assert "reason=transcript-cue" in out

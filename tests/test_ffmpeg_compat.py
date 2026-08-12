@@ -177,7 +177,7 @@ def _capture_extraction_argv(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]
 
 def test_scene_argv_carries_sync_flag(monkeypatch, tmp_path):
     calls = _capture_extraction_argv(monkeypatch)
-    frames.extract_scene_candidates("video.mp4", tmp_path, max_frames=None)
+    frames.extract_scene_candidates("video.mp4", tmp_path)
     argv = calls[0]
     assert _contains_pair(argv, ("-SENTINEL", "vfr"))
     assert argv.index("-SENTINEL") > argv.index("-vf")
@@ -198,7 +198,7 @@ def test_keyframe_argv_carries_sync_flag(monkeypatch, tmp_path):
 # into ~56. The margin is wide and stable.
 
 def test_scene_candidates_are_not_cfr_expanded(cut_clip: Path, tmp_path):
-    out = frames.extract_scene_candidates(str(cut_clip), tmp_path, max_frames=None)
+    out = frames.extract_scene_candidates(str(cut_clip), tmp_path)
     assert len(out) <= 20, f"looks CFR-expanded: {len(out)} frames"
     assert len(out) == len(list(tmp_path.glob("frame_*.jpg")))
 

@@ -48,6 +48,14 @@ SCENE_MIN_FRAMES = 8
 # cost for nothing. Measured effect on the existing fixtures: none, because
 # their gaps are all under 2s.
 GAP_FILL_MIN_SECONDS = 2.0
+# Coverage floor for the uncapped mode's gap-fill. token-burner exists as the
+# maximum-fidelity mode, so it must never cover *less* than balanced — but
+# balanced fills toward its 100-frame cap while the uncapped mode used to fill
+# toward the auto_fps duration target (40-80 on a 1-10 minute clip), returning
+# up to 20% fewer frames than the default it claims to improve on. Equals
+# config.frame_cap("balanced"); kept as a literal because this module
+# deliberately imports nothing from config, and pinned by a release test.
+UNCAPPED_FILL_TARGET = 100
 # Below this many decoded keyframes a clip is too sparse for keyframe coverage
 # (very short or oddly encoded), so the cheap tier falls back to uniform.
 KEYFRAME_MIN = 4
@@ -83,6 +91,16 @@ MAX_READ_DIMENSION = 1998
 DEDUP_THUMB = 16
 DEDUP_THRESHOLD = 2.0
 DEDUP_PEAK_THRESHOLD = 8.0
+# Blank-frame filter: a solid-black end card survives dedup because it genuinely
+# differs from its predecessor, so it spends an image slot on a rectangle of
+# nothing. A thumbnail counts as blank only when BOTH hold — near-black mean AND
+# near-zero spread — and only a *trailing* run of blanks is ever dropped. All
+# three conditions guard false positives: a legitimately dark scene has texture
+# (range >> 2) or a mean well above 8, and a mid-video fade-to-black boundary is
+# real editing information that stays. Mean floor 8 sits under yuv420p's limited-
+# range black of 16; range 2 tolerates encoder ripple on a flat fill.
+BLANK_MAX_LUMA = 8
+BLANK_MAX_RANGE = 2
 SHOWINFO_TS_RE = re.compile(r"pts_time:([0-9.]+)")
 
 # --- ffmpeg frame-sync flag compatibility ------------------------------------
@@ -127,6 +145,7 @@ def _ffmpeg_accepts_option(name: str) -> bool:
     """
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-hide_banner",
         "-loglevel", "error",
         "-f", "lavfi", "-i", "nullsrc=d=0.04",
@@ -194,6 +213,15 @@ MOTION_HARD_MAX = 2000
 # prevent the spend. An explicit --max-frames overrides: the user has then named
 # the number and can be assumed to mean it.
 MOTION_TOKEN_CEILING = 75_000
+# Absolute refusal ceiling for --motion, applied even when the user passed an
+# explicit --max-frames. An explicit cap means "I chose the frame count", and the
+# largest defensible run — MOTION_HARD_MAX frames at the default 512px, ~394k
+# tokens — stays permitted. But the frame count does not bound the cost of
+# reading the frames: the same 2000 at --resolution 1998 on a 4K source is ~6M
+# image tokens, which no answer needs. The refusal names the knobs that actually
+# shrink the cost; there is deliberately no bypass flag, because the agent
+# reading the message is the same agent the guard protects.
+MOTION_TOKEN_HARD_CEILING = 600_000
 
 # Motion envelope tuning. The old design put a single absolute floor of 6.0 on
 # the *per-frame* change, which is what made a cross-dissolve and a light-mode
@@ -585,6 +613,7 @@ def extract_motion(
 
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-hide_banner",
         "-loglevel", "info",          # showinfo writes at info level
         "-y",
@@ -693,6 +722,37 @@ def image_tokens(width: int, height: int) -> int:
     of a decision, and the number the docs used to quote was 3-5x too high.
     """
     return int(width * height / 750)
+
+
+def motion_token_estimate(
+    duration_seconds: float,
+    source_fps: float | None,
+    cap: int,
+    width: int | None,
+    height: int | None,
+    resolution: int,
+    crop: tuple[int, int, int, int] | None = None,
+) -> tuple[int, int, int]:
+    """Estimate ``(frames, tokens_per_frame, total_tokens)`` for a --motion run.
+
+    Pure arithmetic over the same functions the extractor uses, so the estimate
+    cannot drift from what extraction would actually produce. An unknown frame
+    rate assumes the worst (the cap — motion_interval does no thinning without a
+    rate, so the run really would extract up to the cap); unknown dimensions
+    return zero token figures, which callers treat as unguardable.
+    """
+    cap = max(1, min(cap, MOTION_HARD_MAX))
+    if source_fps:
+        interval = motion_interval(duration_seconds, source_fps, cap)
+        estimated = (
+            min(cap, int(source_fps * duration_seconds)) if interval == 0
+            else int(duration_seconds / interval)
+        )
+    else:
+        estimated = cap
+    dims = frame_dimensions(width, height, resolution, crop)
+    per_frame = image_tokens(*dims) if dims else 0
+    return estimated, per_frame, estimated * per_frame
 
 
 def _scale_filter(resolution: int) -> str:
@@ -834,7 +894,7 @@ def scan_duration(video_path: str) -> float:
     if shutil.which("ffmpeg") is None:
         return 0.0
     result = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-v", "error", "-stats",
+        ["ffmpeg", "-nostdin", "-hide_banner", "-v", "error", "-stats",
          "-i", str(Path(video_path).resolve()),
          "-map", "0:v:0", "-c", "copy", "-f", "null", "-"],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -974,6 +1034,7 @@ def extract(
     output_pattern = str(out_dir / "frame_%04d.jpg")
     cmd: list[str] = [
         "ffmpeg",
+        "-nostdin",
         "-hide_banner",
         "-loglevel", "info",          # showinfo writes at info level
         "-y",
@@ -985,7 +1046,13 @@ def extract(
     if end_seconds is not None:
         cmd += ["-to", f"{end_seconds:.3f}"]
 
-    interval = 1.0 / fps if fps > 0 else 0.0
+    # A non-positive rate would make the select expression pass EVERY decoded
+    # frame (interval 0 satisfies gte() on each one) — measured ~18,000 JPEGs on
+    # a 10-minute 30fps clip before _even_sample thinned them back. No caller
+    # legitimately wants that from this function; motion mode has its own path.
+    if fps <= 0:
+        raise SystemExit(f"frame sampling rate must be positive (got {fps:g})")
+    interval = 1.0 / fps
     select = (
         rf"select='isnan(prev_selected_t)+gte(t-prev_selected_t\,{interval:.6f})'"
     )
@@ -1017,22 +1084,33 @@ def extract(
     offset = start_seconds or 0.0
     timestamps = [round(float(m.group(1)), 3) for m in SHOWINFO_TS_RE.finditer(result.stderr)]
     frames = sorted(out_dir.glob("frame_*.jpg"))
+    fabricated = max(0, len(frames) - len(timestamps))
+    if fabricated:
+        # Lenient like the scene and keyframe engines rather than fatal like
+        # motion mode: this is the default path and a stamp shortfall should not
+        # lose the run. But the report preamble promises measured times, so the
+        # substitution must be disclosed, not silent — these frames are marked
+        # `estimated` and the reader is told once here.
+        print(
+            f"[watch] {fabricated} of {len(frames)} frame timestamps could not be "
+            "measured (showinfo shortfall) — labelled with the requested times and "
+            "marked estimated",
+            file=sys.stderr,
+        )
     out: list[dict] = []
     for i, p in enumerate(frames):
-        if i < len(timestamps):
-            stamp = round(offset + timestamps[i], 3)
-        else:
-            # Lenient like the scene and keyframe engines rather than fatal like
-            # motion mode: this is the default path and a stamp shortfall should
-            # not lose the run. Falls back to the requested time — which is what
-            # every frame used to carry — rather than to the window start.
-            stamp = round(offset + (i * interval), 3)
-        out.append({
+        entry = {
             "index": i,
-            "timestamp_seconds": stamp,
+            "timestamp_seconds": (
+                round(offset + timestamps[i], 3) if i < len(timestamps)
+                else round(offset + (i * interval), 3)
+            ),
             "path": str(p),
             "reason": "uniform",
-        })
+        }
+        if i >= len(timestamps):
+            entry["estimated"] = True
+        out.append(entry)
     if max_frames is not None and len(out) > max_frames:
         out = _even_sample(out, max_frames)
     return out
@@ -1042,18 +1120,19 @@ def extract_scene_candidates(
     video_path: str,
     out_dir: Path,
     resolution: int = 512,
-    max_frames: int | None = 100,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
     crop: tuple[int, int, int, int] | None = None,
     threshold: float = SCENE_THRESHOLD,
 ) -> list[dict]:
-    """Extract first frame plus ffmpeg scene-change frames.
+    """Extract first frame plus every ffmpeg scene-change frame — always uncapped.
 
-    When ``max_frames`` is set, ``-frames:v`` lets ffmpeg stop decoding once it
-    has emitted that many frames (early exit) and avoids writing extras that we
-    would only delete afterwards. ``None`` (uncapped "complete" detail) keeps
-    every detected shot, as the user explicitly opted in.
+    Deliberately no ``max_frames``: capping detection with ``-frames:v`` keeps
+    only the *first* N cuts and silently drops the tail of long videos, which is
+    exactly the truncation :func:`extract_scene_or_uniform` documents as the
+    reason it detects everything and thins afterwards. The parameter existed,
+    defaulted to 100, and was passed as ``None`` by its only production caller —
+    a loaded gun for any future direct caller, now removed.
     """
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
@@ -1065,6 +1144,7 @@ def extract_scene_candidates(
     output_pattern = str(out_dir / "frame_%04d.jpg")
     cmd: list[str] = [
         "ffmpeg",
+        "-nostdin",
         "-hide_banner",
         "-loglevel", "info",
         "-y",
@@ -1080,8 +1160,6 @@ def extract_scene_candidates(
         "-vf", vf,
     ]
     cmd += frame_sync_args()
-    if max_frames is not None:
-        cmd += ["-frames:v", str(max_frames)]
     cmd += [
         "-q:v", "4",
         output_pattern,
@@ -1097,15 +1175,33 @@ def extract_scene_candidates(
     # which whole seconds cannot represent at all.
     timestamps = [round(offset + float(match.group(1)), 3) for match in SHOWINFO_TS_RE.finditer(result.stderr)]
     frames = sorted(out_dir.glob("frame_*.jpg"))
+    fabricated = max(0, len(frames) - len(timestamps))
+    if fabricated:
+        # The old fallback collapsed every extra frame onto the window start —
+        # several frames sharing one fabricated time, which also poisoned the
+        # shot statistics. Estimated frames now carry the last measured stamp,
+        # are marked, and are excluded from shot_stats by the caller.
+        print(
+            f"[watch] {fabricated} of {len(frames)} scene frame timestamps could "
+            "not be measured — probable cause: ffmpeg rejected the frame-sync "
+            f"flag {frame_sync_args() or '(none available)'}; labels are estimated "
+            "and excluded from shot statistics",
+            file=sys.stderr,
+        )
     out: list[dict] = []
     for i, path in enumerate(frames):
-        ts = timestamps[i] if i < len(timestamps) else offset
-        out.append({
+        entry = {
             "index": i,
-            "timestamp_seconds": ts,
+            "timestamp_seconds": (
+                timestamps[i] if i < len(timestamps)
+                else (timestamps[-1] if timestamps else offset)
+            ),
             "path": str(path),
             "reason": "first-frame" if i == 0 else "scene-change",
-        })
+        }
+        if i >= len(timestamps):
+            entry["estimated"] = True
+        out.append(entry)
     return out
 
 
@@ -1200,37 +1296,76 @@ def extract_at_timestamps(
         points = in_window
 
     out: list[dict] = []
+    failed = 0
+    fail_detail: str | None = None
     for t in points:
         path = out_dir / f"{prefix}_{len(out):04d}.jpg"
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-y",
-            "-ss", f"{t:.3f}",
-            "-i", str(Path(video_path).resolve()),
-            "-frames:v", "1",
-            "-vf", f"{_crop_filter(crop)}{_scale_filter(resolution)}",
-            "-q:v", "4",
-            str(path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        if result.returncode == 0 and path.exists():
+        ok, detail = _decode_frame_at(video_path, t, path, resolution, crop)
+        if ok:
             out.append({
                 "index": len(out),
                 "timestamp_seconds": t,
                 "path": str(path),
                 "reason": reason,
             })
+        else:
+            # Count rather than raise (one bad packet must not kill a 99-frame
+            # run) but never swallow: a shortfall the report cannot explain is
+            # the class of lie this pipeline exists to remove.
+            failed += 1
+            if fail_detail is None:
+                fail_detail = detail
+    if failed:
+        # One line for the whole call, not one per frame — a systematically
+        # broken source should not print a hundred of these.
+        print(
+            f"[watch] {failed} of {len(points)} requested frame(s) failed to "
+            f"decode ({fail_detail})",
+            file=sys.stderr,
+        )
 
     meta = {
         "engine": "timestamps",
         "candidate_count": len(requested),
         "selected_count": len(out),
         "dropped_out_of_window": dropped,
+        "extraction_failed": failed,
         "fallback": False,
     }
     return out, meta
+
+
+def _decode_frame_at(
+    video_path: str,
+    t: float,
+    path: Path,
+    resolution: int,
+    crop: tuple[int, int, int, int] | None,
+) -> tuple[bool, str]:
+    """Decode the single frame at absolute time ``t`` into ``path``.
+
+    The one-timestamp decode shared by :func:`extract_at_timestamps` and the
+    gap-fill loop. Returns ``(ok, detail)``, where ``detail`` is the last ffmpeg
+    stderr line on failure and ``""`` on success.
+    """
+    cmd = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-y",
+        "-ss", f"{t:.3f}",
+        "-i", str(Path(video_path).resolve()),
+        "-frames:v", "1",
+        "-vf", f"{_crop_filter(crop)}{_scale_filter(resolution)}",
+        "-q:v", "4",
+        str(path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode == 0 and path.exists():
+        return True, ""
+    lines = (result.stderr or "").strip().splitlines()
+    return False, (lines[-1] if lines else f"exit {result.returncode}")
 
 
 def _even_sample(candidates: list[dict], n: int) -> list[dict]:
@@ -1253,15 +1388,6 @@ def _even_sample(candidates: list[dict], n: int) -> list[dict]:
     for i, frame in enumerate(selected):
         frame["index"] = i
     return selected
-
-
-def _frame_delta(a: bytes, b: bytes) -> float:
-    """Mean absolute per-pixel difference (0-255) between two grayscale
-    thumbnails. Mismatched lengths are treated as maximally different so a
-    decode hiccup never collapses distinct frames."""
-    if not a or len(a) != len(b):
-        return float("inf")
-    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
 
 def _thumb_frames(paths: list[Path]) -> list[bytes]:
@@ -1317,6 +1443,7 @@ def _thumb_frames(paths: list[Path]) -> list[bytes]:
 
     cmd = [
         "ffmpeg",
+        "-nostdin",
         "-hide_banner",
         "-loglevel", "error",
         *source,
@@ -1342,19 +1469,68 @@ def dedupe_perceptual(
     candidates: list[dict],
     threshold: float = DEDUP_THRESHOLD,
     peak_threshold: float = DEDUP_PEAK_THRESHOLD,
-) -> tuple[list[dict], int]:
-    """Drop near-identical frames from a chronological candidate list.
+) -> tuple[list[dict], int, int]:
+    """Drop near-identical frames, then trailing blank frames, from a
+    chronological candidate list.
 
     Thumbnails the extracted JPEGs and greedily removes frames that are within
     *both* ``threshold`` mean per-pixel difference and ``peak_threshold``
-    largest-single-cell difference of the last kept one. Returns
-    ``(survivors, dropped_count)``; a no-op (unchanged list) when thumbnails are
-    unavailable or there are fewer than two candidates.
+    largest-single-cell difference of the last kept one; a trailing run of
+    solid-black frames (end cards) is then dropped on the same thumbnails
+    (:func:`_drop_trailing_blanks`). Returns ``(survivors, dropped_count,
+    blank_dropped)``; a no-op when thumbnails are unavailable or there are
+    fewer than two candidates.
     """
     if len(candidates) <= 1:
-        return candidates, 0
+        return candidates, 0, 0
     thumbs = _thumb_frames([Path(c["path"]) for c in candidates])
-    return _dedupe_by_deltas(candidates, thumbs, threshold, peak_threshold)
+    thumb_by_path = {c["path"]: t for c, t in zip(candidates, thumbs)}
+    kept, n_dropped = _dedupe_by_deltas(candidates, thumbs, threshold, peak_threshold)
+    kept, n_blank = _drop_trailing_blanks(kept, thumb_by_path)
+    return kept, n_dropped, n_blank
+
+
+def _is_blank_thumb(thumb: bytes) -> bool:
+    """Whether a dedup thumbnail shows a solid near-black frame.
+
+    Both conditions must hold: near-black mean AND near-zero spread. A dark but
+    real scene has texture (stars, faces, grain — range well above 2) or a mean
+    above the floor; only a rectangle of nothing satisfies both.
+    """
+    if not thumb:
+        return False
+    return (
+        sum(thumb) / len(thumb) < BLANK_MAX_LUMA
+        and max(thumb) - min(thumb) <= BLANK_MAX_RANGE
+    )
+
+
+def _drop_trailing_blanks(
+    frames: list[dict], thumb_by_path: dict[str, bytes]
+) -> tuple[list[dict], int]:
+    """Drop a *trailing* run of blank frames — never below one surviving frame.
+
+    Trailing only, on purpose: a mid-video fade-to-black boundary and a leading
+    black frame are real editing information and stay. What goes is the solid
+    end card, which survives dedup because it genuinely differs from its
+    predecessor and then spends an image slot saying nothing. Runs before the
+    cap and the gap-fill, so the freed budget buys content.
+    """
+    n = 0
+    while len(frames) > 1:
+        thumb = thumb_by_path.get(frames[-1]["path"])
+        if thumb is None or not _is_blank_thumb(thumb):
+            break
+        try:
+            Path(frames[-1]["path"]).unlink()
+        except OSError:
+            pass
+        frames = frames[:-1]
+        n += 1
+    if n:
+        for i, frame in enumerate(frames):
+            frame["index"] = i
+    return frames, n
 
 
 def _is_near_duplicate(
@@ -1367,11 +1543,10 @@ def _is_near_duplicate(
     one can see a control changing state on an otherwise identical screen.
 
     The mismatch case is handled here rather than left to ``_cell_deltas``,
-    because the two helpers fail in opposite directions: ``_frame_delta`` returns
-    ``inf`` on ragged input, which keeps the frame, while ``_cell_deltas`` returns
-    ``(0.0, 0.0)``, which would silently *delete* it. Deleting frames because a
-    decode hiccup made the thumbnails ragged is exactly the failure the fail-open
-    contract exists to prevent.
+    because that helper returns ``(0.0, 0.0)`` on ragged input — which read as a
+    delta would silently *delete* the frame. Returning False keeps it: deleting
+    frames because a decode hiccup made the thumbnails ragged is exactly the
+    failure the fail-open contract exists to prevent.
     """
     if not thumb or len(thumb) != len(last):
         return False
@@ -1492,38 +1667,6 @@ def shot_stats(
     }
 
 
-def _gap_fill_points(
-    stamps: list[float], end_seconds: float, budget: int, min_gap: float
-) -> list[float]:
-    """Times to add so the biggest holes in ``stamps`` get covered first.
-
-    Repeatedly bisects whichever interval is currently widest, which spreads
-    ``budget`` frames to minimise the worst remaining gap rather than sprinkling
-    them evenly. On the 12-shot / 12-minute fixture that turns a worst gap of
-    250 s into one of ~9 s for the same 100-frame cap.
-
-    The trailing interval — last frame to the end of the clip — is included, and
-    on that fixture it *is* the worst one: the final shot runs 470 s to 720 s and
-    the scene engine represents it with a single frame at 470.
-    """
-    if not stamps or budget <= 0:
-        return []
-    segments = [(a, b) for a, b in zip(stamps, stamps[1:])]
-    if end_seconds > stamps[-1]:
-        segments.append((stamps[-1], end_seconds))
-
-    points: list[float] = []
-    while len(points) < budget:
-        segments.sort(key=lambda s: s[1] - s[0], reverse=True)
-        start, stop = segments[0]
-        if stop - start <= min_gap:
-            break
-        middle = (start + stop) / 2
-        points.append(round(middle, 3))
-        segments[0:1] = [(start, middle), (middle, stop)]
-    return sorted(points)
-
-
 def _fill_time_gaps(
     video_path: str,
     out_dir: Path,
@@ -1531,52 +1674,143 @@ def _fill_time_gaps(
     budget: int,
     resolution: int,
     crop: tuple[int, int, int, int] | None,
-    start_seconds: float | None,
-    end_seconds: float | None,
     min_gap: float = GAP_FILL_MIN_SECONDS,
     window_end: float | None = None,
-) -> tuple[list[dict], int]:
-    """Spend leftover frame budget on the widest holes in the coverage.
+    dedup: bool = True,
+) -> tuple[list[dict], dict]:
+    """Spend leftover frame budget on the widest holes — until fills stop adding
+    distinct content.
 
     Scene detection returns one frame per shot and stops, so a clip with few
     shots leaves most of the cap unused — measured on a 12-minute, 12-shot clip:
     "12 selected from 12 candidates (scene, cap 100)", one frame per 60 s, with a
-    250-second closing shot represented by one frame. The same clip at
-    ``--detail efficient`` returned 50 frames, i.e. the cheap mode beat the
-    default. This spends the remaining 88.
+    250-second closing shot represented by one frame. This spends the remainder,
+    always splitting whichever hole is currently widest.
+
+    But filling is only worth it when the hole *contains something*. The first
+    version padded every source to the cap: on a 300 s static-shot clip it
+    returned 100 frames of which 11 were visually distinct — 89% near-duplicates,
+    decoded back in at the midpoints of the very holes dedup had just emptied.
+    So each fill is now checked with the production dedup rule (*if dedup would
+    have deleted this frame, don't create it*): a fill that near-duplicates ANY
+    known neighbour is unlinked and its hole retired. Any-side rather than
+    both-sides is load-bearing — an interior hole runs from one shot's first
+    frame to the *next* shot's first frame, so on a static shot the midpoint
+    always matches the left bound while differing from the right; a both-sides
+    rule would keep a duplicate at every bisection level of every static hole.
+    A frame matching either bound adds nothing the reader does not already have
+    from that bound. The rescue-from-collapse case (screen recordings whose
+    content evolves between look-alike shots) passes the check by construction —
+    an evolving midpoint differs from both bounds — and is unaffected.
+
+    The check runs *after* the decode because a frame's content cannot be known
+    before decoding it; the incremental widest-hole structure is what bounds the
+    cost — on static content the loop retires the whole timeline in ~a dozen
+    probes instead of decoding the full budget and discarding it.
+
+    ``dedup=False`` (the ``--no-dedup`` run) skips the check entirely: that flag
+    means "keep visually identical frames" and must mean it here too. A failed
+    thumbnail pass fails open the same way dedup itself does.
 
     Runs *after* :func:`_even_sample`, which is not a style choice: that function
     unlinks every candidate it does not select, so frames added before it would
-    be thinned straight back out. New frames are decoded at the chosen times
-    rather than recovered from the discarded candidates for the same reason —
-    by then those JPEGs are gone.
+    be thinned straight back out.
+
+    Returns ``(frames, fill_meta)`` with ``fill_meta`` keys ``filled``,
+    ``rejected``, ``failed`` and ``stop`` (``"budget"`` | ``"min-gap"`` |
+    ``"saturated"`` | ``None`` when no filling was attempted).
     """
+    fill_meta = {"filled": 0, "rejected": 0, "failed": 0, "stop": None}
     if budget <= 0 or not selected:
-        return selected, 0
+        return selected, fill_meta
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for existing in out_dir.glob("fill_*.jpg"):
+        existing.unlink()
+
+    thumbs = _thumb_frames([Path(f["path"]) for f in selected]) if dedup else []
+    check = dedup and len(thumbs) == len(selected)
 
     stamps = [f["timestamp_seconds"] for f in selected]
-    # The caller probes this once and shares it with shot_stats; falling back to
-    # the last frame just means the trailing gap goes unfilled, which is safe.
-    end = window_end if window_end is not None else (end_seconds or stamps[-1])
-    points = _gap_fill_points(stamps, end, budget, min_gap)
-    if not points:
-        return selected, 0
+    # Falling back to the last frame just means the trailing gap goes unfilled,
+    # which is safe — the documented degraded contract for direct callers that
+    # supply no window end.
+    end = window_end if window_end is not None else stamps[-1]
 
-    fills, _meta = extract_at_timestamps(
-        video_path,
-        out_dir,
-        points,
-        resolution=resolution,
-        max_frames=None,
-        start_seconds=start_seconds,
-        end_seconds=end_seconds,
-        crop=crop,
-        reason="gap-fill",
-        prefix="fill",
-    )
+    # Holes as (t0, t1, thumb0, thumb1); a None thumb means unknown, and a fill
+    # is rejected only when it duplicates every *known* neighbour.
+    holes: list[tuple[float, float, bytes | None, bytes | None]] = []
+    for i in range(len(stamps) - 1):
+        holes.append((
+            stamps[i], stamps[i + 1],
+            thumbs[i] if check else None,
+            thumbs[i + 1] if check else None,
+        ))
+    if end > stamps[-1]:
+        holes.append((stamps[-1], end, thumbs[-1] if check else None, None))
+
+    fills: list[dict] = []
+    n_attempted = 0
+    while len(fills) < budget and holes:
+        holes.sort(key=lambda h: h[1] - h[0], reverse=True)
+        t0, t1, th0, th1 = holes.pop(0)
+        if t1 - t0 <= min_gap:
+            fill_meta["stop"] = "min-gap"
+            break
+        middle = round((t0 + t1) / 2, 3)
+        path = out_dir / f"fill_{n_attempted:04d}.jpg"
+        n_attempted += 1
+        ok, _detail = _decode_frame_at(video_path, middle, path, resolution, crop)
+        if not ok:
+            # The hole is left retired: nothing inside it decodes.
+            fill_meta["failed"] += 1
+            continue
+        new_thumb: bytes | None = None
+        if check:
+            got = _thumb_frames([path])
+            new_thumb = got[0] if got else None
+        if new_thumb is not None:
+            duplicate = any(
+                _is_near_duplicate(new_thumb, t, DEDUP_THRESHOLD, DEDUP_PEAK_THRESHOLD)
+                for t in (th0, th1) if t is not None
+            )
+            # A blank fill (mid-black-tail probe) is as worthless as a duplicate
+            # one, and without this it would differ from its non-black neighbour
+            # and reintroduce the end card _drop_trailing_blanks just removed.
+            if duplicate or _is_blank_thumb(new_thumb):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                fill_meta["rejected"] += 1
+                continue
+        fills.append({
+            "index": 0,
+            "timestamp_seconds": middle,
+            "path": str(path),
+            "reason": "gap-fill",
+        })
+        holes.append((t0, middle, th0, new_thumb))
+        holes.append((middle, t1, new_thumb, th1))
+
+    if fill_meta["stop"] is None:
+        if len(fills) >= budget:
+            fill_meta["stop"] = "budget"
+        elif fill_meta["rejected"] or fill_meta["failed"]:
+            fill_meta["stop"] = "saturated"
+        else:
+            fill_meta["stop"] = "min-gap"
+
+    if fill_meta["failed"]:
+        print(
+            f"[watch] {fill_meta['failed']} gap-fill frame(s) failed to decode — "
+            "the holes they targeted stay unfilled",
+            file=sys.stderr,
+        )
+    fill_meta["filled"] = len(fills)
     if not fills:
-        return selected, 0
-    return merge_frames(selected, fills), len(fills)
+        return selected, fill_meta
+    return merge_frames(selected, fills), fill_meta
 
 
 def extract_scene_or_uniform(
@@ -1591,6 +1825,7 @@ def extract_scene_or_uniform(
     crop: tuple[int, int, int, int] | None = None,
     dedup: bool = True,
     scene_threshold: float = SCENE_THRESHOLD,
+    full_duration: float | None = None,
 ) -> tuple[list[dict], dict]:
     """Prefer scene selection, falling back to uniform only when the video is
     effectively static (fewer than ``SCENE_MIN_FRAMES`` detected shots).
@@ -1608,7 +1843,6 @@ def extract_scene_or_uniform(
         video_path,
         out_dir,
         resolution=resolution,
-        max_frames=None,
         crop=crop,
         start_seconds=start_seconds,
         end_seconds=end_seconds,
@@ -1616,49 +1850,63 @@ def extract_scene_or_uniform(
     )
     scene_count = len(scene_frames)
     if scene_count >= SCENE_MIN_FRAMES:
-        # Probed once and shared: both the shot statistics and the gap-fill need
-        # to know where the window ends, and neither is correct without it.
+        # Shared by the shot statistics and the gap-fill, and threaded down from
+        # the caller — which already probed it — rather than re-probed here. The
+        # old re-probe swallowed its own failure (`except SystemExit`), silently
+        # reverting shot_stats to the first-to-last-cut denominator its docstring
+        # warns is 12x wrong and dropping the trailing fill segment. A direct
+        # caller that passes neither end_seconds nor full_duration now gets the
+        # documented degraded stats deterministically instead of on probe luck.
         window_start = start_seconds or 0.0
-        window_end = end_seconds
-        if window_end is None:
-            try:
-                window_end = get_metadata(video_path)["duration_seconds"] or None
-            except SystemExit:
-                window_end = None
+        window_end = end_seconds if end_seconds is not None else (full_duration or None)
         # Read the shot list now: dedup and _even_sample below both delete frames
-        # and their timestamps go with them.
+        # and their timestamps go with them. Estimated stamps are fabrications
+        # (showinfo shortfall), so they are excluded — statistics built on them
+        # are the wrong-denominator bug in a different coat.
         shots = shot_stats(
-            [f["timestamp_seconds"] for f in scene_frames], window_start, window_end
+            [
+                f["timestamp_seconds"] for f in scene_frames
+                if not f.get("estimated")
+            ],
+            window_start,
+            window_end,
         )
-        deduped, n_dropped = dedupe_perceptual(scene_frames) if dedup else (scene_frames, 0)
+        deduped, n_dropped, n_blank = (
+            dedupe_perceptual(scene_frames) if dedup else (scene_frames, 0, 0)
+        )
         cap = len(deduped) if max_frames is None else max_frames
         selected = _even_sample(deduped, cap)
-        # Uncapped detail still fills gaps, against the duration budget rather
-        # than a cap. Skipping it there made `token-burner` — the maximum-fidelity
-        # mode the report's own long-video warning recommends — return *fewer*
-        # frames than `balanced`: measured 12 against 100 on a 12-minute clip,
-        # because balanced topped up to its cap and token-burner stopped at the
-        # detected shots. Uncapped means "keep every shot", not "cover less".
-        fill_target = max_frames if max_frames is not None else target_frames
-        n_filled = 0
-        if fill_target is not None:
-            selected, n_filled = _fill_time_gaps(
-                video_path,
-                out_dir,
-                selected,
-                budget=fill_target - len(selected),
-                resolution=resolution,
-                crop=crop,
-                start_seconds=start_seconds,
-                end_seconds=end_seconds,
-                window_end=window_end,
-            )
+        # Uncapped detail still fills gaps — toward at least balanced's coverage.
+        # `token-burner` is the maximum-fidelity mode, so covering *less* than
+        # the default is a contract violation, and filling only toward the
+        # auto_fps duration target did exactly that on every 1-10 minute clip
+        # (target 40-80 against balanced's cap of 100). max() rather than the
+        # bare constant so a direct caller's larger target survives: the floor
+        # is a floor, not a clamp.
+        fill_target = (
+            max_frames if max_frames is not None
+            else max(target_frames, UNCAPPED_FILL_TARGET)
+        )
+        selected, fill_meta = _fill_time_gaps(
+            video_path,
+            out_dir,
+            selected,
+            budget=fill_target - len(selected),
+            resolution=resolution,
+            crop=crop,
+            window_end=window_end,
+            dedup=dedup,
+        )
         return selected, {
             "engine": "scene",
             "candidate_count": scene_count,
             "deduped_count": n_dropped,
+            "blank_dropped": n_blank,
             "selected_count": len(selected),
-            "gap_filled": n_filled,
+            "gap_filled": fill_meta["filled"],
+            "gap_fill_rejected": fill_meta["rejected"],
+            "gap_fill_failed": fill_meta["failed"],
+            "gap_fill_stop": fill_meta["stop"],
             # Independent of which frames survived — that is the point.
             "shots": shots,
             "fallback": False,
@@ -1694,8 +1942,9 @@ def extract_scene_or_uniform(
     # triggered the fallback is kept separately.
     sampled_count = len(frames)
     n_dropped = 0
+    n_blank = 0
     if dedup:
-        frames, n_dropped = dedupe_perceptual(frames)
+        frames, n_dropped, n_blank = dedupe_perceptual(frames)
     return frames, {
         "engine": "uniform",
         "candidate_count": sampled_count,
@@ -1703,6 +1952,7 @@ def extract_scene_or_uniform(
         # This fallback samples at the caller's rate, so --fps really did bind.
         "fps_applied": True,
         "deduped_count": n_dropped,
+        "blank_dropped": n_blank,
         "selected_count": len(frames),
         "fallback": True,
         # Uncapped detail modes still land a real cap here: `fallback_cap` is
@@ -1742,6 +1992,7 @@ def extract_keyframes(
     output_pattern = str(out_dir / "frame_%04d.jpg")
     cmd: list[str] = [
         "ffmpeg",
+        "-nostdin",
         "-hide_banner",
         "-loglevel", "info",
         "-y",
@@ -1788,15 +2039,30 @@ def extract_keyframes(
     offset = start_seconds or 0.0
     # 3 decimals, as in the scene engine: measured pts, so keep the millisecond.
     timestamps = [round(offset + float(m.group(1)), 3) for m in SHOWINFO_TS_RE.finditer(result.stderr)]
+    fabricated = max(0, len(files) - len(timestamps))
+    if fabricated and result.returncode == 0:
+        # Same disclosure rule as the scene engine: the old fallback collapsed
+        # extras onto the window start, several frames sharing one fabricated
+        # time, silently — while the report promised measured labels.
+        print(
+            f"[watch] {fabricated} of {len(files)} keyframe timestamps could not "
+            "be measured — labels are estimated",
+            file=sys.stderr,
+        )
     candidates: list[dict] = []
     for i, path in enumerate(files):
-        ts = timestamps[i] if i < len(timestamps) else offset
-        candidates.append({
+        entry = {
             "index": i,
-            "timestamp_seconds": ts,
+            "timestamp_seconds": (
+                timestamps[i] if i < len(timestamps)
+                else (timestamps[-1] if timestamps else offset)
+            ),
             "path": str(path),
             "reason": "keyframe",
-        })
+        }
+        if i >= len(timestamps):
+            entry["estimated"] = True
+        candidates.append(entry)
 
     # Too few keyframes → uniform fallback over the same range.
     if len(candidates) < KEYFRAME_MIN:
@@ -1826,8 +2092,9 @@ def extract_keyframes(
         # actually compared, not the too-few keyframes that triggered this path.
         sampled_count = len(frames_out)
         n_dropped = 0
+        n_blank = 0
         if dedup:
-            frames_out, n_dropped = dedupe_perceptual(frames_out)
+            frames_out, n_dropped, n_blank = dedupe_perceptual(frames_out)
         return frames_out, {
             "engine": "uniform",
             # NOT the caller's rate: this fallback derives its own from auto_fps
@@ -1837,6 +2104,7 @@ def extract_keyframes(
             "candidate_count": sampled_count,
             "keyframe_count": len(candidates),
             "deduped_count": n_dropped,
+            "blank_dropped": n_blank,
             "selected_count": len(frames_out),
             "fallback": True,
             # This fallback computes its own budget from `max_frames` (line
@@ -1848,7 +2116,9 @@ def extract_keyframes(
     # Detect-all, drop near-duplicates, then even-sample down to the cap (first +
     # last always kept). ``max_frames is None`` (uncapped) keeps every keyframe.
     candidate_count = len(candidates)
-    deduped, n_dropped = dedupe_perceptual(candidates) if dedup else (candidates, 0)
+    deduped, n_dropped, n_blank = (
+        dedupe_perceptual(candidates) if dedup else (candidates, 0, 0)
+    )
     cap = len(deduped) if max_frames is None else max_frames
     selected = _even_sample(deduped, cap)
     return selected, {
@@ -1856,6 +2126,7 @@ def extract_keyframes(
         "fps_applied": False,
         "candidate_count": candidate_count,
         "deduped_count": n_dropped,
+        "blank_dropped": n_blank,
         "selected_count": len(selected),
         "fallback": False,
         "effective_cap": max_frames,
@@ -1914,7 +2185,15 @@ if __name__ == "__main__":
     else:
         fps, target = auto_fps(effective_duration, max_frames=max_frames)
     if fps_override is not None:
-        fps = fps_override
+        if fps_override <= 0:
+            raise SystemExit(f"--fps must be positive (got {fps_override:g})")
+        if fps_override > MAX_FPS:
+            print(
+                f"[frames] --fps {fps_override:g} exceeds the {MAX_FPS:g} fps "
+                f"ceiling — sampling at {MAX_FPS:g} fps",
+                file=sys.stderr,
+            )
+        fps = min(fps_override, MAX_FPS)
         target = max(1, int(round(fps * effective_duration)))
 
     frames = extract(
@@ -1927,7 +2206,7 @@ if __name__ == "__main__":
     )
     deduped_count = 0
     if dedup:
-        frames, deduped_count = dedupe_perceptual(frames)
+        frames, deduped_count, _blank = dedupe_perceptual(frames)
     print(json.dumps(
         {
             "meta": meta, "fps": fps, "target": target, "focused": focused,

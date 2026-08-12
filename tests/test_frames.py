@@ -189,10 +189,10 @@ def test_lowering_the_threshold_does_not_over_detect_on_camera_cuts(
     so 0.05 and 0.20 must find the same candidates; if they ever diverge the new
     default is firing on encoder noise."""
     low = frames.extract_scene_candidates(
-        str(cut_clip), tmp_path / "low", max_frames=None, threshold=0.05,
+        str(cut_clip), tmp_path / "low", threshold=0.05,
     )
     high = frames.extract_scene_candidates(
-        str(cut_clip), tmp_path / "high", max_frames=None, threshold=0.20,
+        str(cut_clip), tmp_path / "high", threshold=0.20,
     )
     assert len(low) == len(high)
     assert [round(f["timestamp_seconds"], 2) for f in low] == \
@@ -232,14 +232,21 @@ def test_scene_threshold_defaults_into_the_filter_string(monkeypatch, tmp_path):
 # returned 50 frames on the same input, i.e. the cheap mode beat the default.
 
 
-def test_gap_fill_spends_the_budget_on_a_long_take(sparse_cuts_clip: Path, tmp_path: Path):
+def test_gap_fill_spends_the_budget_on_a_moving_long_take(
+    sparse_moving_clip: Path, tmp_path: Path
+):
+    """Content everywhere (the drifting marker makes every fill distinct), so
+    the budget is genuinely spent and the worst hole shrinks from a fifth of
+    the clip to something a reader can navigate."""
+    fps, target = frames.auto_fps(300.0, max_frames=100)
     out, meta = frames.extract_scene_or_uniform(
-        str(sparse_cuts_clip), tmp_path / "f", fps=0.5, target_frames=60, max_frames=100,
+        str(sparse_moving_clip), tmp_path / "f", fps=fps, target_frames=target,
+        max_frames=100, full_duration=300.0,
     )
     assert meta["engine"] == "scene"
-    assert meta["candidate_count"] == 12
-    assert meta["gap_filled"] == 88
-    assert len(out) == 100 <= 100
+    assert meta["candidate_count"] >= 12
+    assert meta["gap_filled"] > 40
+    assert len(out) == 100
 
     stamps = [f["timestamp_seconds"] for f in out]
     assert stamps == sorted(stamps)
@@ -247,13 +254,29 @@ def test_gap_fill_spends_the_budget_on_a_long_take(sparse_cuts_clip: Path, tmp_p
 
     # Every detected shot survives — fills are additive, never a replacement.
     scene_frames = [f for f in out if f["reason"] in ("first-frame", "scene-change")]
-    assert len(scene_frames) == 12
-    assert sum(1 for f in out if f["reason"] == "gap-fill") == 88
+    assert len(scene_frames) >= 12
 
-    # The point of the exercise: the worst hole shrinks from a quarter of the
-    # clip to something a reader can actually navigate.
     gaps = [b - a for a, b in zip(stamps, stamps[1:])]
     assert max(gaps) < 15.0, f"worst gap still {max(gaps):.0f}s"
+
+
+def test_gap_fill_stops_early_on_static_shots(sparse_cuts_clip: Path, tmp_path: Path):
+    """The 89%-duplicate pathology, pinned the other way. 720 s of static solid
+    shots: every fill midpoint duplicates the bounding frame of its own shot, so
+    the fills are rejected, the holes retired, and the run returns the detected
+    shots rather than 100 frames of padding — which is what the measured
+    '100 frames, 11 visually distinct' regression was."""
+    out, meta = frames.extract_scene_or_uniform(
+        str(sparse_cuts_clip), tmp_path / "f", fps=0.5, target_frames=60,
+        max_frames=100, full_duration=720.0,
+    )
+    assert meta["engine"] == "scene"
+    assert meta["gap_fill_rejected"] > 0
+    assert meta["gap_fill_stop"] == "saturated"
+    assert meta["gap_filled"] == 0
+    assert len(out) == 12
+    scene_frames = [f for f in out if f["reason"] in ("first-frame", "scene-change")]
+    assert len(scene_frames) == 12
 
 
 def test_gap_fill_leaves_a_densely_cut_clip_alone(cut_clip: Path, tmp_path: Path):
@@ -288,31 +311,140 @@ def test_gap_fill_frames_do_not_clobber_transcript_cues(
         str(sparse_cuts_clip), out_dir, [100.0, 200.0, 300.0],
     )
     assert len(cues) == 3
+    # dedup=False so fills survive on this static fixture — the point here is
+    # the filename-prefix contract, not the rejection rule.
     frames.extract_scene_or_uniform(
         str(sparse_cuts_clip), out_dir, fps=0.5, target_frames=60, max_frames=100,
+        dedup=False, full_duration=720.0,
     )
     assert len(list(out_dir.glob("cue_*.jpg"))) == 3
     assert all(Path(c["path"]).exists() for c in cues)
     assert list(out_dir.glob("fill_*.jpg"))
 
 
-def test_gap_fill_points_bisect_the_widest_hole_first():
+def _fake_decode(monkeypatch) -> list[float]:
+    """Route _decode_frame_at to a stub that records the requested times and
+    writes a placeholder JPEG, so the fill loop's geometry runs without ffmpeg."""
+    order: list[float] = []
+
+    def fake(video_path, t, path, resolution, crop):
+        order.append(t)
+        Path(path).write_bytes(b"jpg")
+        return True, ""
+
+    monkeypatch.setattr(frames, "_decode_frame_at", fake)
+    return order
+
+
+def _selected_at(dirpath: Path, stamps: list[float]) -> list[dict]:
+    dirpath.mkdir(parents=True, exist_ok=True)
+    out = []
+    for i, t in enumerate(stamps):
+        p = dirpath / f"frame_{i:04d}.jpg"
+        p.write_bytes(b"x")
+        out.append({"index": i, "timestamp_seconds": t, "path": str(p), "reason": "scene-change"})
+    return out
+
+
+def test_gap_fill_bisects_the_widest_hole_first(monkeypatch, tmp_path: Path):
     """Pure geometry, no ffmpeg: the placement rule minimises the worst gap
     rather than spreading frames evenly."""
-    points = frames._gap_fill_points([0.0, 10.0, 100.0], end_seconds=100.0, budget=3, min_gap=2.0)
+    _fake_decode(monkeypatch)
+    selected = _selected_at(tmp_path, [0.0, 10.0, 100.0])
+    out, meta = frames._fill_time_gaps(
+        "v.mp4", tmp_path, selected, budget=3, resolution=512, crop=None,
+        window_end=100.0, dedup=False,
+    )
     # 90-wide hole first, then its 45-wide halves — never the 10-wide one.
-    assert points == [32.5, 55.0, 77.5]
+    fills = sorted(f["timestamp_seconds"] for f in out if f["reason"] == "gap-fill")
+    assert fills == [32.5, 55.0, 77.5]
+    assert meta["filled"] == 3
+    assert meta["stop"] == "budget"
 
 
-def test_gap_fill_points_respect_the_minimum_gap():
-    assert frames._gap_fill_points([0.0, 1.0, 2.0], end_seconds=2.0, budget=10, min_gap=2.0) == []
+def test_gap_fill_respects_the_minimum_gap(monkeypatch, tmp_path: Path):
+    _fake_decode(monkeypatch)
+    selected = _selected_at(tmp_path, [0.0, 1.0, 2.0])
+    out, meta = frames._fill_time_gaps(
+        "v.mp4", tmp_path, selected, budget=10, resolution=512, crop=None,
+        window_end=2.0, dedup=False,
+    )
+    assert meta["filled"] == 0
+    assert meta["stop"] == "min-gap"
+    assert out == selected
 
 
-def test_gap_fill_points_cover_the_tail_after_the_last_frame():
+def test_gap_fill_covers_the_tail_after_the_last_frame(monkeypatch, tmp_path: Path):
     """The trailing hole is routinely the worst one: a closing shot has exactly
     one detected frame, at its start."""
-    points = frames._gap_fill_points([0.0, 1.0], end_seconds=100.0, budget=1, min_gap=2.0)
-    assert points == [50.5]
+    _fake_decode(monkeypatch)
+    selected = _selected_at(tmp_path, [0.0, 1.0])
+    out, _meta = frames._fill_time_gaps(
+        "v.mp4", tmp_path, selected, budget=1, resolution=512, crop=None,
+        window_end=100.0, dedup=False,
+    )
+    fills = [f["timestamp_seconds"] for f in out if f["reason"] == "gap-fill"]
+    assert fills == [50.5]
+
+
+def test_gap_fill_survives_a_single_frame_and_unknown_end(monkeypatch, tmp_path: Path):
+    """Regression: one surviving frame + no window end used to IndexError on an
+    empty segment list after the budget check passed."""
+    _fake_decode(monkeypatch)
+    selected = _selected_at(tmp_path, [5.0])
+    out, meta = frames._fill_time_gaps(
+        "v.mp4", tmp_path, selected, budget=3, resolution=512, crop=None,
+        window_end=None, dedup=False,
+    )
+    assert out == selected
+    assert meta["filled"] == 0
+
+
+def test_gap_fill_rejects_candidates_dedup_would_delete(monkeypatch, tmp_path: Path):
+    """If dedup would have deleted the frame, don't create it: a fill matching
+    any known neighbour is unlinked and its hole retired."""
+    _fake_decode(monkeypatch)
+    flat = bytes([100] * (frames.DEDUP_THUMB * frames.DEDUP_THUMB))
+    monkeypatch.setattr(frames, "_thumb_frames", lambda paths: [flat] * len(paths))
+    selected = _selected_at(tmp_path, [0.0, 100.0])
+    out, meta = frames._fill_time_gaps(
+        "v.mp4", tmp_path, selected, budget=10, resolution=512, crop=None,
+        window_end=100.0, dedup=True,
+    )
+    assert meta["filled"] == 0
+    assert meta["rejected"] == 1          # one probe retired the only hole
+    assert meta["stop"] == "saturated"
+    assert len(out) == 2
+    assert not list(tmp_path.glob("fill_*.jpg"))
+
+
+def test_gap_fill_fails_open_when_thumbnails_unavailable(monkeypatch, tmp_path: Path):
+    """A failed thumbnail pass must degrade to unchecked filling — the same
+    fail-open contract dedup itself has — not to no filling."""
+    _fake_decode(monkeypatch)
+    monkeypatch.setattr(frames, "_thumb_frames", lambda paths: [])
+    selected = _selected_at(tmp_path, [0.0, 100.0])
+    _out, meta = frames._fill_time_gaps(
+        "v.mp4", tmp_path, selected, budget=3, resolution=512, crop=None,
+        window_end=100.0, dedup=True,
+    )
+    assert meta["filled"] == 3
+    assert meta["rejected"] == 0
+
+
+def test_gap_fill_counts_failed_decodes(monkeypatch, tmp_path: Path):
+    def fake(video_path, t, path, resolution, crop):
+        return False, "boom"
+
+    monkeypatch.setattr(frames, "_decode_frame_at", fake)
+    selected = _selected_at(tmp_path, [0.0, 100.0])
+    out, meta = frames._fill_time_gaps(
+        "v.mp4", tmp_path, selected, budget=3, resolution=512, crop=None,
+        window_end=100.0, dedup=False,
+    )
+    assert meta["filled"] == 0
+    assert meta["failed"] == 1            # the hole is retired, not retried
+    assert out == selected
 
 
 # --- shot statistics ----------------------------------------------------------
@@ -436,6 +568,7 @@ def test_real_clip_shot_rate_matches_its_duration(sparse_cuts_clip: Path, tmp_pa
     span-based denominator reported 1.4, and called the 250s closing shot 200s."""
     _, meta = frames.extract_scene_or_uniform(
         str(sparse_cuts_clip), tmp_path / "f", fps=0.5, target_frames=60, max_frames=100,
+        full_duration=720.0,
     )
     shots = meta["shots"]
     assert shots["cuts"] == 11
@@ -443,24 +576,93 @@ def test_real_clip_shot_rate_matches_its_duration(sparse_cuts_clip: Path, tmp_pa
     assert shots["longest_s"] == pytest.approx(250.0, abs=1.0)
 
 
-def test_token_burner_covers_at_least_as_much_as_balanced(sparse_cuts_clip: Path, tmp_path: Path):
-    """The maximum-fidelity mode must not return fewer frames than the default.
+def test_shot_stats_degrade_deterministically_without_a_window(
+    sparse_cuts_clip: Path, tmp_path: Path
+):
+    """A direct caller that passes neither end_seconds nor full_duration gets
+    the documented degraded stats (cut-span denominator, no closing shot) —
+    deterministically, not on the luck of a hidden re-probe that used to swallow
+    its own failure."""
+    _, meta = frames.extract_scene_or_uniform(
+        str(sparse_cuts_clip), tmp_path / "f", fps=0.5, target_frames=60, max_frames=100,
+    )
+    shots = meta["shots"]
+    assert shots["cuts"] == 11
+    # Span-based: 11 cuts over the 5..470s cut span, not the 720s clip.
+    assert shots["per_minute"] == pytest.approx(11 / (465.0 / 60.0), abs=0.1)
+    assert shots["longest_s"] == pytest.approx(200.0, abs=1.0)
 
-    Gap-fill was gated on `max_frames is not None`, so token-burner — which the
-    report's own long-video warning recommends for better coverage — stopped at
-    the 12 detected shots while balanced topped up to 100. Uncapped means "keep
-    every shot", not "cover less".
+
+def test_scene_engine_does_not_probe_metadata_internally(
+    monkeypatch, sparse_cuts_clip: Path, tmp_path: Path
+):
+    """The window end is threaded down from the caller, never re-probed: the old
+    hidden get_metadata call swallowed SystemExit and silently degraded the shot
+    stats exactly when ffprobe was struggling."""
+    def boom(video_path):
+        raise AssertionError("extract_scene_or_uniform must not call get_metadata")
+
+    monkeypatch.setattr(frames, "get_metadata", boom)
+    _, meta = frames.extract_scene_or_uniform(
+        str(sparse_cuts_clip), tmp_path / "f", fps=0.5, target_frames=60, max_frames=100,
+        full_duration=720.0,
+    )
+    assert meta["shots"]["cuts"] == 11
+
+
+def test_token_burner_covers_at_least_as_much_as_balanced(
+    sparse_moving_clip: Path, tmp_path: Path
+):
+    """The maximum-fidelity mode must not return fewer frames than the default —
+    under PRODUCTION conditions.
+
+    The first version of this test passed target_frames=100 to both arms and
+    used a 720 s fixture, the one duration band where auto_fps returns the cap —
+    so it could not fail while watch.py's real call (target = auto_fps's 40-80
+    on a 1-10 minute clip) returned 20% fewer frames from token-burner than from
+    balanced. This one derives the target the way watch.py does and asserts the
+    band first.
     """
+    fps, target = frames.auto_fps(300.0, max_frames=100)
+    assert target < 100, "precondition: the duration band that exposes the bug"
     balanced, _ = frames.extract_scene_or_uniform(
-        str(sparse_cuts_clip), tmp_path / "b", fps=0.5, target_frames=100, max_frames=100,
+        str(sparse_moving_clip), tmp_path / "b", fps=fps, target_frames=target,
+        max_frames=100, full_duration=300.0,
     )
     burner, meta = frames.extract_scene_or_uniform(
-        str(sparse_cuts_clip), tmp_path / "t", fps=0.5, target_frames=100, max_frames=None,
+        str(sparse_moving_clip), tmp_path / "t", fps=fps, target_frames=target,
+        max_frames=None, full_duration=300.0,
     )
     assert len(burner) >= len(balanced), f"token-burner {len(burner)} < balanced {len(balanced)}"
     assert meta["gap_filled"] > 0
     # Every detected shot still survives — filling is additive.
-    assert sum(1 for f in burner if f["reason"] in ("first-frame", "scene-change")) == 12
+    assert sum(1 for f in burner if f["reason"] in ("first-frame", "scene-change")) >= 12
+
+
+def test_uncapped_fill_budget_is_at_least_the_capped_one(
+    monkeypatch, sparse_cuts_clip: Path, tmp_path: Path
+):
+    """The F1 invariant pinned at the budget level, decoupled from how many
+    fills survive the duplicate check: both arms must hand _fill_time_gaps the
+    same coverage target when the duration target sits under the cap."""
+    targets: list[int] = []
+    real = frames._fill_time_gaps
+
+    def spy(video_path, out_dir, selected, budget, **kwargs):
+        targets.append(budget + len(selected))
+        return real(video_path, out_dir, selected, budget, **kwargs)
+
+    monkeypatch.setattr(frames, "_fill_time_gaps", spy)
+    frames.extract_scene_or_uniform(
+        str(sparse_cuts_clip), tmp_path / "b", fps=0.5, target_frames=80,
+        max_frames=100, full_duration=720.0,
+    )
+    frames.extract_scene_or_uniform(
+        str(sparse_cuts_clip), tmp_path / "t", fps=0.5, target_frames=80,
+        max_frames=None, full_duration=720.0,
+    )
+    assert len(targets) == 2
+    assert targets[1] >= targets[0] == 100
 
 
 def test_uncapped_fill_does_not_shrink_a_cut_heavy_clip(cut_clip: Path, tmp_path: Path):
@@ -565,3 +767,154 @@ def test_headerless_clip_gets_normal_frame_coverage(headerless_clip: Path, tmp_p
     )
     assert len(out) > 5
     assert max(f["timestamp_seconds"] for f in out) > 4.0
+
+
+# --- fps bounds ----------------------------------------------------------------
+
+
+def test_extract_rejects_a_non_positive_rate(static_clip: Path, tmp_path: Path):
+    """fps <= 0 used to make the select expression pass EVERY decoded frame
+    (~18,000 JPEGs on a 10-minute clip) before thinning. No caller legitimately
+    wants that; motion mode has its own path."""
+    with pytest.raises(SystemExit, match="must be positive"):
+        frames.extract(str(static_clip), tmp_path / "f", fps=0.0)
+    with pytest.raises(SystemExit, match="must be positive"):
+        frames.extract(str(static_clip), tmp_path / "f", fps=-1.0)
+
+
+def test_module_cli_rejects_a_non_positive_fps(static_clip: Path, tmp_path: Path):
+    import subprocess
+    import sys as _sys
+
+    proc = subprocess.run(
+        [_sys.executable, str(Path(frames.__file__)), str(static_clip),
+         str(tmp_path / "out"), "--fps", "0"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode != 0
+    assert "must be positive" in proc.stderr
+
+
+def test_module_cli_clamps_and_reports_a_high_fps(static_clip: Path, tmp_path: Path):
+    import subprocess
+    import sys as _sys
+
+    proc = subprocess.run(
+        [_sys.executable, str(Path(frames.__file__)), str(static_clip),
+         str(tmp_path / "out"), "--fps", "25"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "exceeds" in proc.stderr and "sampling at 2 fps" in proc.stderr
+
+
+# --- extract_at_timestamps failure accounting ----------------------------------
+
+
+def test_timestamp_extraction_counts_decode_failures(monkeypatch, tmp_path: Path):
+    """A failed per-frame decode used to vanish: no counter, no stderr, and the
+    report explained the shortfall with the only number it had (out-of-window),
+    which was wrong."""
+    calls = {"n": 0}
+
+    def flaky(video_path, t, path, resolution, crop):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return False, "Invalid data found when processing input"
+        Path(path).write_bytes(b"jpg")
+        return True, ""
+
+    monkeypatch.setattr(frames, "_decode_frame_at", flaky)
+    out, meta = frames.extract_at_timestamps(
+        "v.mp4", tmp_path, [1.0, 2.0, 3.0],
+    )
+    assert len(out) == 2
+    assert meta["selected_count"] == 2
+    assert meta["extraction_failed"] == 1
+    assert [f["index"] for f in out] == [0, 1]
+
+
+# --- estimated timestamps are marked, never silent ------------------------------
+
+
+def _short_showinfo_run(monkeypatch, n_files: int, n_stamps: int):
+    """Fake the extraction subprocess: writes n_files JPEGs but reports only
+    n_stamps pts_time lines — the showinfo-shortfall degraded path."""
+    def fake_run(cmd, *args, **kwargs):
+        pattern = cmd[-1]
+        for i in range(1, n_files + 1):
+            Path(pattern % i).write_bytes(b"jpg")
+
+        class _Result:
+            returncode = 0
+            stdout = ""
+            stderr = "\n".join(
+                f"[Parsed_showinfo] n:{i} pts_time:{i * 0.5:.6f}" for i in range(n_stamps)
+            )
+
+        return _Result()
+
+    monkeypatch.setattr(frames.subprocess, "run", fake_run)
+
+
+def test_uniform_stamp_shortfall_is_marked_estimated(monkeypatch, tmp_path: Path, capsys):
+    monkeypatch.setattr(frames, "frame_sync_args", lambda: ())
+    monkeypatch.setattr(frames.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    _short_showinfo_run(monkeypatch, n_files=4, n_stamps=2)
+    out = frames.extract("v.mp4", tmp_path, fps=2.0, max_frames=10)
+    assert len(out) == 4
+    assert [bool(f.get("estimated")) for f in out] == [False, False, True, True]
+    assert "marked estimated" in capsys.readouterr().err
+
+
+def test_scene_stamp_shortfall_is_marked_and_excluded_from_shot_stats(
+    monkeypatch, tmp_path: Path, capsys
+):
+    """Extras used to collapse onto the window start — several frames sharing one
+    fabricated time — and those fabrications flowed straight into shot_stats."""
+    monkeypatch.setattr(frames, "frame_sync_args", lambda: ())
+    monkeypatch.setattr(frames.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    _short_showinfo_run(monkeypatch, n_files=5, n_stamps=3)
+    out = frames.extract_scene_candidates("v.mp4", tmp_path)
+    assert len(out) == 5
+    assert [bool(f.get("estimated")) for f in out] == [False, False, False, True, True]
+    # Estimated frames carry the LAST measured stamp, not the window start.
+    assert out[3]["timestamp_seconds"] == out[2]["timestamp_seconds"]
+    assert out[4]["timestamp_seconds"] == out[2]["timestamp_seconds"]
+    assert "estimated" in capsys.readouterr().err
+    # And shot_stats sees only the measured ones (the caller filters).
+    measured = [f["timestamp_seconds"] for f in out if not f.get("estimated")]
+    assert len(measured) == 3
+
+
+# --- motion token estimate -------------------------------------------------------
+
+
+def test_motion_token_estimate_matches_the_extraction_arithmetic():
+    # 2s at 60fps under a 2000 cap: every source frame, 120 of them.
+    est, per, total = frames.motion_token_estimate(2.0, 60.0, 2000, 1920, 1080, 512, None)
+    assert est == 120
+    assert per == frames.image_tokens(512, 288)
+    assert total == est * per
+
+
+def test_motion_token_estimate_assumes_the_cap_without_a_rate():
+    est, _, _ = frames.motion_token_estimate(60.0, None, 2000, 640, 360, 512, None)
+    assert est == 2000
+
+
+def test_motion_token_estimate_is_unguardable_without_dimensions():
+    est, per, total = frames.motion_token_estimate(2.0, 60.0, 2000, None, None, 512, None)
+    assert per == 0 and total == 0
+
+
+def test_explicit_max_frames_at_full_resolution_on_4k_exceeds_the_hard_ceiling():
+    """The bypass the hard ceiling exists for: 2000 frames at --resolution 1998
+    on a 4K source is ~6M image tokens — no answer needs that."""
+    _, _, total = frames.motion_token_estimate(35.0, 60.0, 2000, 3840, 2160, 1998, None)
+    assert total > frames.MOTION_TOKEN_HARD_CEILING
+    # ...while the largest defensible run — the full cap at default resolution —
+    # stays under it and is permitted.
+    _, _, sane = frames.motion_token_estimate(35.0, 60.0, 2000, 1920, 1080, 512, None)
+    assert sane < frames.MOTION_TOKEN_HARD_CEILING

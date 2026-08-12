@@ -68,6 +68,7 @@ def build_cut_clip(
     seg: float = 0.4,
     size: str = "320x240",
     fps: int = 10,
+    tail_black: float = 0.0,
 ) -> None:
     """Concatenate ``n`` solid-color segments into one clip with ``n`` cuts.
 
@@ -75,13 +76,20 @@ def build_cut_clip(
     changes. x264's own scenecut detection is unreliable on flat fills, so we
     force a keyframe at every ``seg`` boundary — giving ~n real keyframes for
     the keyframe engine to find.
+
+    ``tail_black`` appends that many seconds of solid black — the end-card shape
+    the blank-frame filter exists for.
     """
     inputs: list[str] = []
     for i in range(n):
         color = COLORS[i % len(COLORS)]
         inputs += ["-f", "lavfi", "-t", str(seg), "-i", f"color=c={color}:s={size}:r={fps}"]
-    streams = "".join(f"[{i}:v]" for i in range(n))
-    filt = f"{streams}concat=n={n}:v=1:a=0[out]"
+    total = n
+    if tail_black > 0:
+        inputs += ["-f", "lavfi", "-t", str(tail_black), "-i", f"color=c=black:s={size}:r={fps}"]
+        total += 1
+    streams = "".join(f"[{i}:v]" for i in range(total))
+    filt = f"{streams}concat=n={total}:v=1:a=0[out]"
     _run([
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         *inputs,
@@ -118,6 +126,87 @@ def cut_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
 def static_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
     path = tmp_path_factory.mktemp("clips") / "static.mp4"
     build_static_clip(path)
+    return path
+
+
+@pytest.fixture(scope="session")
+def cut_clip_black_tail(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """cut_clip with 1.4s of solid black appended: 7.0s total, black end card."""
+    path = tmp_path_factory.mktemp("clips") / "cuts_black_tail.mp4"
+    build_cut_clip(path, tail_black=1.4)
+    return path
+
+
+# --- sparse-moving fixture ----------------------------------------------------
+# The gap-fill calibration clip: 300 s of 12 solid-colour shots (11 cuts) with a
+# small two-tone marker drifting across the frame, so a gap-fill probe anywhere
+# is visually DISTINCT from its neighbours while the per-frame scene score stays
+# orders of magnitude under the 0.05 threshold.
+#
+# 300 s is the cheapest duration that exposes the token-burner/balanced coverage
+# inversion: auto_fps targets 80 frames in the 180-600 s band while balanced's
+# cap is 100, so an uncapped mode filling toward the *target* returns fewer
+# frames than the capped default. Durations sum to exactly 300.
+#
+# Marker geometry is calibrated against the dedup thumbnail grid (16x16 cells of
+# 20x15 px on a 320x240 frame): 20x30 px at y=180 spans exactly two cell rows,
+# top half black / bottom half white, so against ANY solid background one half
+# carries a contrast of at least 128. It drifts at 4 px/s (x = mod(4t, 300)), so
+# two frames >= 1 s apart — the worst-case midpoint-to-bound distance the fill
+# loop compares at — differ by >= 4 px of marker travel: measured peak cell
+# delta 18 at 1 s against DEDUP_PEAK_THRESHOLD = 8 (2 px/s measured exactly 8.0,
+# i.e. ON the threshold — hence 4). The wrap period is 75 s, longer than the
+# longest shot (60 s), so no two frames inside one fill hole can alias to the
+# same marker position; each wrap repaints two marker footprints in one frame, a
+# scene score of ~0.02 — still under the 0.05 detection threshold.
+# Fixture-precondition tests in test_fixtures.py pin both calibrations.
+SPARSE_MOVING_SHOTS: tuple[tuple[str, int], ...] = (
+    ("black", 5), ("olive", 5), ("navy", 5), ("gray", 5),
+    ("blue", 10), ("orange", 10), ("green", 20), ("cyan", 30),
+    ("red", 40), ("yellow", 50), ("magenta", 60), ("white", 60),
+)
+
+
+def build_sparse_moving_clip(path: Path, size: str = "320x240", fps: int = 10) -> None:
+    inputs: list[str] = []
+    for color, dur in SPARSE_MOVING_SHOTS:
+        inputs += ["-f", "lavfi", "-t", str(dur), "-i", f"color=c={color}:s={size}:r={fps}"]
+    n = len(SPARSE_MOVING_SHOTS)
+    inputs += ["-f", "lavfi", "-t", "300", "-i", f"color=c=black:s=20x30:r={fps}"]
+    streams = "".join(f"[{i}:v]" for i in range(n))
+    starts, t = [], 0.0
+    for _, dur in SPARSE_MOVING_SHOTS[:-1]:
+        t += dur
+        starts.append(f"{t:g}")
+    filt = (
+        f"{streams}concat=n={n}:v=1:a=0[base];"
+        f"[{n}:v]drawbox=y=15:w=20:h=15:color=white:t=fill[mk];"
+        f"[base][mk]overlay=x='mod(4*t\\,300)':y=180:eval=frame[out]"
+    )
+    _run([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        *inputs,
+        "-filter_complex", filt, "-map", "[out]",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+        "-pix_fmt", "yuv420p", "-g", "300",
+        "-force_key_frames", ",".join(starts),
+        str(path),
+    ])
+
+
+def sparse_moving_cut_times() -> list[float]:
+    """The 11 authored cut times, derived from the durations."""
+    times, t = [], 0.0
+    for _, dur in SPARSE_MOVING_SHOTS[:-1]:
+        t += dur
+        times.append(t)
+    return times
+
+
+@pytest.fixture(scope="session")
+def sparse_moving_clip(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    path = tmp_path_factory.mktemp("clips") / "sparse_moving.mp4"
+    build_sparse_moving_clip(path)
     return path
 
 

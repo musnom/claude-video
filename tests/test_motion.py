@@ -277,7 +277,7 @@ def test_motion_does_not_dedup(motion_clip: Path, tmp_path):
         str(motion_clip), tmp_path, 0.0, 3.0, source_fps=60.0
     )
     assert info["deduped_count"] == 0
-    kept, dropped = frames.dedupe_perceptual(list(extracted))
+    kept, dropped, _blank = frames.dedupe_perceptual(list(extracted))
     assert dropped > 0, "fixture should be dedup-vulnerable, else the test proves nothing"
     assert len(extracted) > len(kept)
 

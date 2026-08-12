@@ -30,13 +30,19 @@ python3 "${SKILL_DIR}/scripts/watch.py" "<source>" \
 The report prints, independently of which frames survived sampling:
 
 ```
-- **Shots:** 840 cuts, 84.0/min — median 0.50s, p10 0.47s, p90 3.20s (shortest 0.40s, longest 6.10s)
+- **Shots:** at least 840 cuts (detected at scene threshold 0.05), 84.0/min — median 0.50s, p10 0.47s, p90 3.20s (shortest 0.40s, longest 6.10s)
 ```
 
 These come from the full detected-cut list, so they describe the video rather than the frame
 budget. **Do not compute pacing from the gaps between the frame paths** — those gaps are the
 sampling interval, and reading them as shot lengths under-reports a fast-cut piece by an
 order of magnitude.
+
+The count is a **lower bound**: detection misses cuts under the scene threshold, and
+low-contrast graphic cuts are exactly the kind it misses (measured −65% on a low-contrast
+piece at the default threshold). Quote it as "at least" — and since a floor in a pacing band
+still means that band *or faster*, the bands below stay usable. If the frames visibly cut
+faster than the number implies, re-run with `--scene-threshold 0.03` before quoting anything.
 
 How to read it:
 

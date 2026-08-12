@@ -142,7 +142,7 @@ Resolve them the same way as the scripts: `${SKILL_DIR}/references/<name>.md`.
   - 1-3min → ~60 frames
   - 3-10min → ~80 frames
   - \>10min → up to the detail cap (warning printed)
-- **The scene engine spends the whole cap.** It takes one frame per detected cut, then fills the widest remaining time gaps until the cap is reached, so a long video with few cuts no longer comes back with a handful of frames spread an minute apart. Expect `balanced` to return close to 100 frames on most inputs; the **Frames** line reports how many were added to fill gaps (`reason=gap-fill`) versus found by detection.
+- **The scene engine spends the cap on distinct content.** It takes one frame per detected cut, then fills the widest remaining time gaps — but each fill is checked against its neighbouring frames with the same rule dedup uses, and filling stops when the remaining candidates are near-duplicates. So a long video with few cuts but *changing* content (screen recordings, slow pans) comes back near the cap, while a long video of genuinely static shots comes back with roughly its detected shots and the **Frames** line says `fill stopped early: N near-duplicate candidates rejected`. Expect `balanced` to return close to 100 frames on inputs whose long shots actually change; a much smaller count with that note is the tool saving your tokens, not missing content.
 - If the user hands you a long video, consider asking whether they want a specific section before burning tokens on a full scan.
 
 ## How to invoke
@@ -265,7 +265,11 @@ Every frame line is `t=MM:SS.mmm` — millisecond precision, because a clip that
 
 **`- **Shots:** …`** appears whenever scene detection ran. It is computed from the *full* detected-cut list, independently of which frames survived the cap — so it is the number to quote for pacing. Do **not** compute cutting rate from the gaps between the frame paths; those describe the sampling, not the video.
 
+The count is a **lower bound** — detection misses cuts below the scene threshold (measured: −16% on ordinary footage, −65% on low-contrast material) — which is why the line reads `at least N cuts (detected at scene threshold T)`. Quote it that way: "at least N cuts, R/min at the detection threshold". If the frames visibly cut faster than the number implies, re-run with `--scene-threshold 0.03`.
+
 If a `Counted before near-duplicate removal` note follows it, some of those cuts were between visually similar shots.
+
+A frame marked `estimated` carries a requested time, not a measured one (its measured timestamp was unavailable); such frames are excluded from the Shots statistics automatically.
 
 ## Transcript-cue frames
 
